@@ -1,0 +1,3215 @@
+// ==UserScript==
+// @name         Foresight Chute Visualizer Pro
+// @namespace    local.foresight.chute.visualizer.pro
+// @version      39.0
+// @description  Foresight chute visualizer with safe DOM Top Recirc harvesting, compact allocations, mapped Grafana names, vertical creator mark, and single-scroll layout.
+// @author       janazare
+// @match        https://sort.aka.amazon.com/foresight/*
+// @match        https://sort-eu.aka.amazon.com/foresight/*
+// @match        https://grafana-prod.prod.us-east-1.grafana.insights.aft.amazon.dev/*
+// @grant        GM_addStyle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_xmlhttpRequest
+// @connect      grafana-prod.prod.us-east-1.grafana.insights.aft.amazon.dev
+// ==/UserScript==
+
+// creator: @janazare
+// mark: FCV-PRO-JANAZARE-31
+
+// creator: @janazare
+// mark: FCV-PRO-JANAZARE-34
+
+(function () {
+    'use strict';
+
+    // ======================================================
+    // Foresight Chute Visualizer Pro
+    // Original enhancement set by janazare
+    // FCV-JZ-001 / FGLWB-JZ-001
+    // ======================================================
+
+    const BUILD = {
+        name: "Foresight Chute Visualizer Pro",
+        version: "39.0",
+        author: "janazare",
+        signature: "FCV-PRO-JZ-001"
+    };
+
+    const CONFIG = {
+        recircThreshold: 10,
+        severeRecircThreshold: 20,
+        refreshMs: 1500,
+        grafanaRefreshMs: 5000,
+        allocationScheduleMinutes: [11, 41],
+        scanDelayMs: 650,
+        maxGrafanaItems: 8,
+        maxTopRecircItems: 5,
+        allocationAreaOrder: ["SR", "FR1", "FR0", "FR2"],
+        ids: {
+            control: "fcv-pro-control-bar",
+            legend: "fcv-pro-legend",
+            grafana: "fcv-pro-grafana-panel",
+            allocations: "fcv-pro-allocations-panel",
+            topRecirc: "fcv-pro-top-recirc",
+            allTable: "fcv-pro-all-table",
+            allocationFrame: "fcv-pro-allocation-frame",
+            grafanaBadge: "fcv-pro-grafana-badge"
+        },
+        storage: {
+            grafana: "FCV_PRO_GRAFANA_LANE_WATCH_CACHE_V1",
+            grafanaDiag: "FCV_PRO_GRAFANA_DIAGNOSTICS_V1",
+            allocations: "FCV_PRO_ALLOCATIONS_CACHE_V1",
+            prefs: "FCV_PRO_PREFS_V1"
+        }
+    };
+
+    const CHUTE_COLORS = {
+        SR: "#8E44AD",
+        FR0: "#E67E22",
+        FR1: "#00A6D6",
+        FR2: "#F1C40F",
+        DD: "#1F4E79"
+    };
+
+    const STATUS_COLORS = {
+        available: "#90EE90",
+        recirc: "#66A3FF",
+        unavailable: "#E5E5E5",
+        disabled: "#A9A9A9",
+        failed: "#FF4D4D",
+        pending: "#FFFF00",
+        open: "#FFA500"
+    };
+
+    const AREA_ORDER = ["SR", "FR1", "FR0", "FR2", "DD"];
+
+    const AREA_LABELS = {
+        SR: "Spirals",
+        FR1: "Flats",
+        FR0: "High Velocity",
+        FR2: "High Velocity 2.0",
+        DD: "Fluids"
+    };
+
+    const GRAFANA_LANE_NAME_MAP = {
+        S011501: "West Jackpot 1501",
+        S010941: "Main Jackpot Short Chute 941",
+        S010942: "Main Jackpot Long Chute 942",
+        S010441: "East Jackpot 441",
+        S010931: "Spirals Bypass 931",
+        S011511: "Flats Bypass 1511"
+    };
+
+    const STATE = {
+        collapsed: false,
+        hidden: false,
+        lastAutoLaneScanMs: 0,
+        panels: {
+            legend: false,
+            grafana: true,
+            allocations: true,
+            topRecirc: true,
+            allTable: false
+        },
+        filters: {
+            recircOnly: false,
+            hideDisabled: false,
+            families: new Set()
+        },
+        scanRunning: false,
+        laneCache: new Map(),
+        headers: [],
+        sortIndex: null,
+        sortDirection: "desc"
+    };
+
+    const DEFAULT_PANEL_STATE = JSON.parse(JSON.stringify(STATE.panels));
+
+    GM_addStyle(`
+#fcv-pro-control-bar,
+#fcv-pro-legend,
+#fcv-pro-grafana-panel,
+#fcv-pro-allocations-panel,
+#fcv-pro-top-recirc,
+#fcv-pro-all-table {
+    box-sizing: border-box;
+    width: 100%;
+    font-family: Arial, sans-serif;
+}
+
+#fcv-pro-control-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 8px 0 6px 0;
+    padding: 8px 10px;
+    background: #111827;
+    color: #ffffff;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 800;
+    box-shadow: 0 1px 3px rgba(0,0,0,.18);
+}
+
+#fcv-pro-control-bar .fcv-pro-title {
+    font-size: 14px;
+    font-weight: 900;
+    margin-right: 8px;
+}
+
+#fcv-pro-control-bar.fcv-pro-collapsed {
+    position: sticky;
+    top: 0;
+    z-index: 9999;
+    margin-bottom: 8px;
+}
+
+#fcv-pro-control-bar.fcv-pro-collapsed .fcv-pro-toggle-buttons,
+#fcv-pro-control-bar.fcv-pro-collapsed #fcv-pro-scan,
+#fcv-pro-control-bar.fcv-pro-collapsed #fcv-pro-reset {
+    display: none !important;
+}
+
+body.fcv-pro-master-collapsed #fcv-pro-legend,
+body.fcv-pro-master-collapsed #fcv-pro-grafana-panel,
+body.fcv-pro-master-collapsed #fcv-pro-allocations-panel,
+body.fcv-pro-master-collapsed #fcv-pro-top-recirc,
+body.fcv-pro-master-collapsed #fcv-pro-all-table {
+    display: none !important;
+}
+
+#fcv-pro-show-tab {
+    position: fixed;
+    top: 6px;
+    right: 10px;
+    z-index: 99999;
+    background: #111827;
+    color: #ffffff;
+    border: 1px solid #374151;
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 900;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,.28);
+}
+
+#fcv-pro-show-tab:hover {
+    background: #1f2937;
+}
+
+body.fcv-pro-master-hidden #fcv-pro-control-bar,
+body.fcv-pro-master-hidden #fcv-pro-legend,
+body.fcv-pro-master-hidden #fcv-pro-grafana-panel,
+body.fcv-pro-master-hidden #fcv-pro-allocations-panel,
+body.fcv-pro-master-hidden #fcv-pro-top-recirc,
+body.fcv-pro-master-hidden #fcv-pro-all-table {
+    display: none !important;
+}
+
+
+#fcv-pro-control-bar button,
+#fcv-pro-legend button,
+#fcv-pro-grafana-panel button {
+    font-size: 12px;
+    font-weight: 800;
+    padding: 3px 8px;
+    border: 1px solid #879596;
+    border-radius: 5px;
+    background: #f7fafa;
+    color: #111111;
+    cursor: pointer;
+}
+
+#fcv-pro-control-bar button:hover,
+#fcv-pro-legend button:hover,
+#fcv-pro-grafana-panel button:hover {
+    background: #eaeded;
+}
+
+#fcv-pro-control-bar button.fcv-pro-active,
+#fcv-pro-legend button.fcv-pro-active {
+    background: #22c55e;
+    color: #111111;
+    border-color: #22c55e;
+}
+
+#fcv-pro-control-bar button.fcv-pro-off {
+    background: #374151;
+    color: #ffffff;
+    border-color: #4b5563;
+}
+
+#fcv-pro-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 7px 10px;
+    margin: 0 0 6px 0;
+    padding: 7px 9px;
+    background: #ffffff;
+    border: 1px solid #d5dbdb;
+    border-radius: 6px;
+    color: #111111;
+    font-size: 12px;
+    line-height: 18px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.06);
+}
+
+#fcv-pro-legend span {
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+    font-weight: 800;
+}
+
+#fcv-pro-legend b {
+    display: inline-block;
+    width: 13px;
+    height: 13px;
+    min-width: 13px;
+    margin-right: 5px;
+    border: 1px solid #222;
+    border-radius: 2px;
+}
+
+#fcv-pro-legend .fcv-pro-controls {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    align-items: center;
+}
+
+.fcv-pro-panel {
+    margin: 0 0 6px 0;
+    background: #ffffff;
+    border: 1px solid #d5dbdb;
+    border-radius: 6px;
+    color: #111111;
+    font-size: 12px;
+    line-height: 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.06);
+    overflow: hidden;
+}
+
+.fcv-pro-panel-title {
+    background: linear-gradient(90deg, #8E44AD 0%, #00A6D6 25%, #E67E22 50%, #F1C40F 75%, #1F4E79 100%);
+    color: #ffffff;
+    font-size: 13px;
+    font-weight: 900;
+    text-align: center;
+    padding: 5px 8px;
+    text-shadow: 0 1px 2px rgba(0,0,0,.35);
+}
+
+.fcv-pro-panel-subtitle {
+    background: #f7fafa;
+    color: #374151;
+    font-size: 11px;
+    font-weight: 700;
+    text-align: center;
+    padding: 4px 8px;
+    border-bottom: 1px solid #d5dbdb;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(140px, 1fr));
+}
+
+#fcv-pro-grafana-panel .fcv-pro-card {
+    border-right: 1px solid #d5dbdb;
+    min-height: 60px;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-card:last-child {
+    border-right: none;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-card-title {
+    font-weight: 900;
+    padding: 4px 6px;
+    background: #f7fafa;
+    border-bottom: 1px solid #d5dbdb;
+    text-align: center;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-list {
+    padding: 4px 6px;
+}
+
+.fcv-pro-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 6px;
+    font-weight: 800;
+    padding: 1px 0;
+    border-bottom: 1px solid #f0f0f0;
+}
+
+.fcv-pro-item-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fcv-pro-item-count {
+    min-width: 28px;
+    text-align: right;
+}
+
+.fcv-pro-severe {
+    color: #D13212;
+    font-weight: 900;
+}
+
+.fcv-pro-warning {
+    color: #B45309;
+    font-weight: 900;
+}
+
+.fcv-pro-good {
+    color: #2E7D32;
+    font-weight: 900;
+}
+
+.fcv-pro-empty {
+    color: #777777;
+    font-style: italic;
+    font-weight: 700;
+    text-align: center;
+    padding: 6px;
+}
+
+.fcv-pro-actions {
+    display: flex;
+    justify-content: center;
+    gap: 6px;
+    padding: 5px;
+    background: #f7fafa;
+    border-top: 1px solid #d5dbdb;
+}
+
+#fcv-pro-allocations-panel table,
+#fcv-pro-top-recirc table,
+#fcv-pro-all-table table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+}
+
+#fcv-pro-allocations-panel th,
+#fcv-pro-allocations-panel td,
+#fcv-pro-top-recirc th,
+#fcv-pro-top-recirc td {
+    border: 1px solid #d5dbdb;
+    padding: 4px 6px;
+    text-align: left;
+    vertical-align: top;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-header-row th,
+#fcv-pro-top-recirc .fcv-pro-area-row th {
+    font-size: 12px;
+    font-weight: 900;
+    text-align: center;
+    background: #f7fafa;
+}
+
+.fcv-pro-status-pill {
+    display: inline-block;
+    min-width: 70px;
+    padding: 2px 6px;
+    border-radius: 999px;
+    font-weight: 900;
+    text-align: center;
+    border: 1px solid rgba(0,0,0,.15);
+}
+
+.fcv-pro-subtext {
+    color: #555;
+    font-size: 10px;
+    font-weight: 700;
+}
+
+#fcv-pro-all-table {
+    max-height: 70vh;
+    overflow: auto;
+}
+
+#fcv-pro-all-table .fcv-pro-all-title {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    background: #111827;
+    color: #fff;
+    padding: 6px 9px;
+    font-size: 13px;
+    font-weight: 900;
+}
+
+#fcv-pro-all-table th {
+    position: sticky;
+    top: 31px;
+    z-index: 3;
+    background: #f7fafa;
+    border: 1px solid #d5dbdb;
+    padding: 5px 7px;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 900;
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+}
+
+#fcv-pro-all-table td {
+    border: 1px solid #d5dbdb;
+    padding: 4px 7px;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.fcv-pro-chute-zone {
+    font-weight: 700 !important;
+}
+
+tr.fcv-pro-row-hidden {
+    display: none !important;
+}
+
+body.fcv-pro-all-mode .awsui-table-container {
+    display: none !important;
+}
+
+#fcv-pro-grafana-badge {
+    position: fixed;
+    right: 14px;
+    bottom: 14px;
+    z-index: 99999;
+    background: #111827;
+    color: #ffffff;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 800;
+    box-shadow: 0 2px 8px rgba(0,0,0,.35);
+}
+
+
+#fcv-pro-control-bar {
+    justify-content: space-between !important;
+    position: relative !important;
+    top: auto !important;
+    z-index: 100 !important;
+}
+
+#fcv-pro-control-bar .fcv-pro-left-controls,
+#fcv-pro-control-bar .fcv-pro-right-controls {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+#fcv-pro-hide-all,
+#fcv-pro-show-tab,
+#fcv-pro-scan,
+button[data-panel="allTable"] {
+    display: none !important;
+}
+
+/* Do not hide the native Foresight table anymore. This fixes the scrolling/table disappearing issue. */
+body.fcv-pro-all-mode .awsui-table-container {
+    display: block !important;
+}
+
+#fcv-pro-all-table {
+    display: none !important;
+}
+
+
+
+
+
+#fcv-pro-allocation-frame {
+    display: none !important;
+    width: 0 !important;
+    height: 0 !important;
+    border: 0 !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-area-table {
+    width: 100%;
+    table-layout: fixed !important;
+    border-collapse: collapse;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-area-table th {
+    color: #ffffff;
+    text-align: center;
+    font-size: 11px !important;
+    padding: 4px 5px !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-area-table td {
+    vertical-align: top !important;
+    padding: 3px 4px !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-card {
+    margin: 0 0 3px 0;
+    padding: 3px 4px;
+    border-radius: 4px;
+    border: 1px solid #d5dbdb;
+    background: #ffffff;
+    line-height: 12px;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-status-line {
+    margin-top: 2px;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-empty-area {
+    color: #777777;
+    font-style: italic;
+    text-align: center;
+    font-weight: 700;
+    padding: 5px;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-meta {
+    background: #FFF7CC;
+    color: #111111;
+    font-size: 10px;
+    font-weight: 800;
+    text-align: center;
+    padding: 3px 6px;
+    border-bottom: 1px solid #d5dbdb;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-chute {
+    display: inline-block;
+    min-width: 72px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-weight: 900;
+    text-align: center;
+    margin-right: 5px;
+    border: 1px solid rgba(0,0,0,.25);
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-filter {
+    font-weight: 900;
+}
+
+
+
+
+/* v29 solid, calmer title bars */
+#fcv-pro-grafana-panel .fcv-pro-panel-title {
+    background: #1F4E79 !important;
+    color: #ffffff !important;
+    text-shadow: none !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-panel-title {
+    background: #2E7D32 !important;
+    color: #ffffff !important;
+    text-shadow: none !important;
+}
+
+#fcv-pro-top-recirc .fcv-pro-panel-title {
+    background: #374151 !important;
+    color: #ffffff !important;
+    text-shadow: none !important;
+}
+
+/* v29 legend lives in static top row */
+#fcv-pro-control-bar .fcv-pro-inline-legend {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+    margin-left: 8px;
+}
+
+#fcv-pro-control-bar .fcv-pro-inline-legend span {
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+    font-size: 10px;
+    font-weight: 900;
+    color: #ffffff;
+}
+
+#fcv-pro-control-bar .fcv-pro-inline-legend b {
+    width: 10px;
+    height: 10px;
+    min-width: 10px;
+    display: inline-block;
+    border-radius: 2px;
+    border: 1px solid rgba(255,255,255,.7);
+    margin-right: 3px;
+}
+
+#fcv-pro-legend,
+button[data-panel="legend"] {
+    display: none !important;
+}
+
+/* v29 allocation cards: chute + status same line, proposed allocation below */
+#fcv-pro-allocations-panel .fcv-pro-allocation-card {
+    padding: 2px 3px !important;
+    margin: 0 0 2px 0 !important;
+    line-height: 11px !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-topline {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    justify-content: space-between;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-chute {
+    min-width: auto !important;
+    padding: 1px 4px !important;
+    margin-right: 0 !important;
+    font-size: 10px !important;
+    line-height: 12px !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-status-pill {
+    min-width: auto !important;
+    padding: 1px 5px !important;
+    font-size: 9px !important;
+    line-height: 12px !important;
+    white-space: nowrap;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-subtext {
+    margin-top: 1px;
+    font-size: 9px !important;
+    line-height: 10px !important;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-filter {
+    display: none !important;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-panel-subtitle {
+    display: none !important;
+}
+
+/* v28 compact title rows */
+#fcv-pro-grafana-panel .fcv-pro-panel-title,
+#fcv-pro-allocations-panel .fcv-pro-panel-title,
+#fcv-pro-top-recirc .fcv-pro-panel-title {
+    min-height: 18px;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-title-row .fcv-pro-title-pill {
+    background: #008000 !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-title-row .fcv-pro-title-meta {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    margin-right: 150px;
+    color: #ffffff;
+    font-size: 10px;
+    font-weight: 800;
+    white-space: nowrap;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-grid {
+    grid-template-columns: repeat(2, minmax(180px, 1fr)) !important;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-actions {
+    display: none !important;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-item-name {
+    font-weight: 900;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-item {
+    padding: 2px 6px !important;
+}
+
+#fcv-pro-top-recirc .fcv-pro-top-line {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+#fcv-pro-top-recirc .fcv-pro-top-lane {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#fcv-pro-top-recirc .fcv-pro-top-count {
+    min-width: 24px;
+    text-align: right;
+}
+
+/* v26 sticky: only FCV Pro bar and legend */
+#fcv-pro-control-bar {
+    position: relative !important;
+    top: auto !important;
+    z-index: 100 !important;
+}
+
+#fcv-pro-legend {
+    position: relative !important;
+    top: auto !important;
+    z-index: 100 !important;
+}
+
+/* v26 title bars with right-side timer/status pill */
+.fcv-pro-title-row {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    position: relative;
+}
+
+.fcv-pro-title-row .fcv-pro-title-main {
+    font-weight: 900;
+}
+
+.fcv-pro-title-row .fcv-pro-title-pill {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: #008000;
+    color: #ffffff;
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: 900;
+    text-shadow: none;
+    white-space: nowrap;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-title-row .fcv-pro-title-pill {
+    background: #1F4E79;
+}
+
+/* v26 Top Recirc row backgrounds matching Grafana severity style */
+#fcv-pro-top-recirc .fcv-pro-top-line {
+    margin: 0 0 2px 0;
+    padding: 2px 4px;
+    border-radius: 3px;
+    font-weight: 900;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+#fcv-pro-top-recirc .fcv-pro-top-good {
+    background: #E8F5E9;
+    color: #2E7D32;
+}
+
+#fcv-pro-top-recirc .fcv-pro-top-warning {
+    background: #FFF4D6;
+    color: #B45309;
+}
+
+#fcv-pro-top-recirc .fcv-pro-top-severe {
+    background: #FDE2E1;
+    color: #D13212;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-allocation-meta {
+    display: none !important;
+}
+
+/* prevent the old v22 override from making legend non-sticky */
+
+/* v23 Grafana severity colors: original Grafana-style green / orange / red */
+#fcv-pro-grafana-panel {
+    border-left: 5px solid #2E7D32 !important;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-panel-title {
+    background: linear-gradient(90deg, #2E7D32 0%, #F59E0B 55%, #D13212 100%) !important;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-card-title {
+    background: #111827 !important;
+    color: #ffffff !important;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-item {
+    border-bottom: 1px solid #e5e7eb !important;
+    padding: 2px 4px !important;
+    border-radius: 3px;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-item:has(.fcv-pro-good) {
+    background: #E8F5E9;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-item:has(.fcv-pro-warning) {
+    background: #FFF4D6;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-item:has(.fcv-pro-severe) {
+    background: #FDE2E1;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-good {
+    color: #2E7D32 !important;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-warning {
+    color: #B45309 !important;
+}
+
+#fcv-pro-grafana-panel .fcv-pro-severe {
+    color: #D13212 !important;
+}
+
+
+#fcv-pro-grafana-panel .fcv-pro-good-row { background: #E8F5E9 !important; }
+#fcv-pro-grafana-panel .fcv-pro-warning-row { background: #FFF4D6 !important; }
+#fcv-pro-grafana-panel .fcv-pro-severe-row { background: #FDE2E1 !important; }
+
+/* v23 Allocations: compact, allocation-page-inspired green / yellow / red */
+#fcv-pro-allocations-panel {
+    border-left: 5px solid #F59E0B !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-panel-title {
+    background: linear-gradient(90deg, #F59E0B 0%, #FACC15 45%, #22C55E 100%) !important;
+    color: #111111 !important;
+    text-shadow: none !important;
+}
+
+#fcv-pro-allocations-panel table {
+    table-layout: auto !important;
+}
+
+#fcv-pro-allocations-panel th,
+#fcv-pro-allocations-panel td {
+    padding: 2px 5px !important;
+    font-size: 11px !important;
+    line-height: 13px !important;
+    vertical-align: middle !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-header-row th {
+    background: #FFF7CC !important;
+    color: #111111 !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-subtext {
+    font-size: 9px !important;
+    line-height: 10px !important;
+    opacity: .75;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 520px;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-status-pill {
+    min-width: 66px !important;
+    padding: 1px 6px !important;
+    font-size: 10px !important;
+    line-height: 13px !important;
+    border-radius: 999px !important;
+}
+
+/* Distinguish allocation rows by status without making the table bulky */
+#fcv-pro-allocations-panel tr:has(.fcv-pro-status-pill[style*="00FF00"]) td,
+#fcv-pro-allocations-panel tr:has(.fcv-pro-status-pill[style*="22C55E"]) td {
+    background: #E8F5E9;
+}
+
+#fcv-pro-allocations-panel tr:has(.fcv-pro-status-pill[style*="FFFF00"]) td,
+#fcv-pro-allocations-panel tr:has(.fcv-pro-status-pill[style*="FACC15"]) td {
+    background: #FFFDE7;
+}
+
+#fcv-pro-allocations-panel tr:has(.fcv-pro-status-pill[style*="FF4D4D"]) td,
+#fcv-pro-allocations-panel tr:has(.fcv-pro-status-pill[style*="D13212"]) td {
+    background: #FDE2E1;
+}
+
+#fcv-pro-allocations-panel tr:has(.fcv-pro-status-pill[style*="FFA500"]) td,
+#fcv-pro-allocations-panel tr:has(.fcv-pro-status-pill[style*="F59E0B"]) td {
+    background: #FFF4D6;
+}
+
+/* v22 scroll safety: never trap page scrolling */
+html,
+body {
+    overflow-y: auto !important;
+    overflow-x: auto !important;
+    height: auto !important;
+}
+
+#fcv-pro-control-bar {
+    position: relative !important;
+    top: auto !important;
+    z-index: 100 !important;
+}
+
+#fcv-pro-legend,
+#fcv-pro-grafana-panel,
+#fcv-pro-allocations-panel,
+#fcv-pro-top-recirc {
+    position: relative !important;
+    max-height: none !important;
+    overflow: visible !important;
+}
+
+#fcv-pro-control-bar.fcv-pro-collapsed {
+    position: relative !important;
+    top: auto !important;
+}
+
+body.fcv-pro-master-collapsed #fcv-pro-legend,
+body.fcv-pro-master-collapsed #fcv-pro-grafana-panel,
+body.fcv-pro-master-collapsed #fcv-pro-allocations-panel,
+body.fcv-pro-master-collapsed #fcv-pro-top-recirc,
+body.fcv-pro-master-collapsed #fcv-pro-all-table {
+    display: none !important;
+}
+
+body.fcv-pro-master-collapsed,
+body.fcv-pro-master-hidden,
+body.fcv-pro-all-mode {
+    overflow-y: auto !important;
+    height: auto !important;
+}
+
+
+#fcv-pro-control-bar { position: relative !important; top: auto !important; z-index: 100 !important; }
+#fcv-pro-legend { position: relative !important; top: auto !important; z-index: 100 !important; }
+#fcv-pro-grafana-panel, #fcv-pro-allocations-panel, #fcv-pro-top-recirc { position: relative !important; top: auto !important; }
+
+/* v30: top controls are static, not sticky */
+#fcv-pro-control-bar {
+    position: relative !important;
+    top: auto !important;
+    z-index: 100 !important;
+    display: flex !important;
+    justify-content: space-between !important;
+    align-items: center !important;
+    gap: 8px !important;
+    background: #111827 !important;
+}
+
+#fcv-pro-control-bar .fcv-pro-title {
+    display: none !important;
+}
+
+#fcv-pro-control-bar .fcv-pro-left-controls {
+    display: inline-flex !important;
+    align-items: center !important;
+    flex-wrap: wrap !important;
+    gap: 8px !important;
+    flex: 1 1 auto !important;
+}
+
+#fcv-pro-control-bar .fcv-pro-right-controls {
+    display: inline-flex !important;
+    align-items: center !important;
+    flex-wrap: wrap !important;
+    gap: 6px !important;
+    justify-content: flex-end !important;
+}
+
+#fcv-pro-control-bar .fcv-pro-inline-legend {
+    display: inline-flex !important;
+    flex-wrap: wrap !important;
+    align-items: center !important;
+    gap: 6px 8px !important;
+    margin-left: 0 !important;
+}
+
+#fcv-pro-control-bar .fcv-pro-inline-legend span {
+    display: inline-flex !important;
+    align-items: center !important;
+    white-space: nowrap !important;
+    font-size: 11px !important;
+    font-weight: 900 !important;
+    color: #ffffff !important;
+}
+
+#fcv-pro-control-bar .fcv-pro-inline-legend b {
+    width: 11px !important;
+    height: 11px !important;
+    min-width: 11px !important;
+    display: inline-block !important;
+    border-radius: 2px !important;
+    border: 1px solid rgba(255,255,255,.75) !important;
+    margin-right: 3px !important;
+}
+
+#fcv-pro-legend,
+button[data-panel="legend"],
+#fcv-pro-reset {
+    display: none !important;
+}
+
+/* v30: solid title bars */
+#fcv-pro-grafana-panel .fcv-pro-panel-title {
+    background: #1F4E79 !important;
+    background-image: none !important;
+    color: #ffffff !important;
+    text-shadow: none !important;
+}
+
+#fcv-pro-allocations-panel .fcv-pro-panel-title {
+    background: #2E7D32 !important;
+    background-image: none !important;
+    color: #ffffff !important;
+    text-shadow: none !important;
+}
+
+#fcv-pro-top-recirc .fcv-pro-panel-title {
+    background: #374151 !important;
+    background-image: none !important;
+    color: #ffffff !important;
+    text-shadow: none !important;
+}
+
+/* v30: prevent Foresight/AWS table header from sticking in the middle of the page */
+.awsui-table-container,
+.awsui-table-container *,
+[class*="awsui-table-container"],
+[class*="awsui-table-container"] *,
+table thead,
+table thead tr,
+table thead th {
+    position: static !important;
+    top: auto !important;
+    bottom: auto !important;
+    transform: none !important;
+}
+
+/* keep page scrolling normal */
+html,
+body {
+    overflow-y: auto !important;
+    height: auto !important;
+}
+
+#fcv-pro-control-bar.fcv-pro-collapsed {
+    position: relative !important;
+    top: auto !important;
+}
+
+
+
+
+
+/* FCV Pro v36: safer panel-only dark mode and sticky-table fix */
+#fcv-pro-control-bar {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    width: 100vw !important;
+    z-index: 2147483000 !important;
+    margin: 0 !important;
+    border-radius: 0 !important;
+}
+
+body.fcv-pro-has-fixed-bar {
+    padding-top: var(--fcv-pro-toolbar-height, 58px) !important;
+}
+
+/* Disable Foresight/AWS sticky table pieces that float mid-page */
+.awsui-table-container [style*="sticky"],
+.awsui-table-container [class*="sticky"],
+.awsui-table-container [class*="Sticky"],
+[class*="awsui-table"] [style*="sticky"],
+[class*="awsui-table"] [class*="sticky"],
+[class*="awsui-table"] [class*="Sticky"],
+table thead,
+table thead tr,
+table thead th {
+    position: static !important;
+    top: auto !important;
+    bottom: auto !important;
+    transform: none !important;
+}
+
+/* Panel-only dark mode. Do not darken the entire Foresight page. */
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel,
+body.fcv-pro-dark-mode #fcv-pro-allocations-panel,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc {
+    background: #111827 !important;
+    color: #e5e7eb !important;
+    border-color: #374151 !important;
+}
+
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel table,
+body.fcv-pro-dark-mode #fcv-pro-allocations-panel table,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc table,
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel td,
+body.fcv-pro-dark-mode #fcv-pro-allocations-panel td,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc td,
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel th,
+body.fcv-pro-dark-mode #fcv-pro-allocations-panel th,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc th {
+    border-color: #374151 !important;
+}
+
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-card-title,
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-actions,
+body.fcv-pro-dark-mode #fcv-pro-allocations-panel .fcv-pro-actions,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc .fcv-pro-actions {
+    background: #1f2937 !important;
+    color: #e5e7eb !important;
+}
+
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-empty,
+body.fcv-pro-dark-mode #fcv-pro-allocations-panel .fcv-pro-empty,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc .fcv-pro-empty,
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-subtext,
+body.fcv-pro-dark-mode #fcv-pro-allocations-panel .fcv-pro-subtext,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc .fcv-pro-subtext {
+    color: #cbd5e1 !important;
+}
+
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-good-row,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc .fcv-pro-top-good {
+    background: #12351f !important;
+    color: #86efac !important;
+}
+
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-warning-row,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc .fcv-pro-top-warning {
+    background: #422f0b !important;
+    color: #fbbf24 !important;
+}
+
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-severe-row,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc .fcv-pro-top-severe {
+    background: #451a1a !important;
+    color: #fca5a5 !important;
+}
+
+
+/* FCV Pro v37 vertical creator mark */
+#fcv-pro-creator-signature {
+    position: fixed !important;
+    left: 3px !important;
+    bottom: 8px !important;
+    z-index: 2147483001 !important;
+    writing-mode: vertical-rl !important;
+    transform: rotate(180deg) !important;
+    font-size: 10px !important;
+    line-height: 10px !important;
+    font-weight: 800 !important;
+    letter-spacing: .5px !important;
+    color: rgba(255, 255, 255, 0.18) !important;
+    background: transparent !important;
+    pointer-events: none !important;
+    user-select: none !important;
+    text-shadow: 0 1px 1px rgba(0,0,0,.25) !important;
+}
+
+@media(max-width:900px){
+    #fcv-pro-grafana-panel .fcv-pro-grid{grid-template-columns:1fr}
+    #fcv-pro-grafana-panel .fcv-pro-card{border-right:none;border-bottom:1px solid #d5dbdb}
+}
+`);
+
+    function norm(value) {
+        return String(value || "").replace(/\s+/g, " ").trim();
+    }
+
+    function lower(value) {
+        return norm(value).toLowerCase();
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? "")
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#39;");
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function isGrafanaPage() {
+        return location.hostname.includes("grafana-prod.prod.us-east-1.grafana.insights.aft.amazon.dev");
+    }
+
+    function isForesightPage() {
+        return location.hostname.includes("sort.aka.amazon.com") ||
+               location.hostname.includes("sort-eu.aka.amazon.com");
+    }
+
+    function loadPrefs() {
+        try {
+            const saved = GM_getValue(CONFIG.storage.prefs, {});
+            if (typeof saved.collapsed === "boolean") STATE.collapsed = saved.collapsed;
+            if (typeof saved.hidden === "boolean") STATE.hidden = saved.hidden;
+            if (saved.panels) Object.assign(STATE.panels, saved.panels);
+        } catch (e) {}
+    }
+
+    function savePrefs() {
+        try {
+            GM_setValue(CONFIG.storage.prefs, { collapsed: STATE.collapsed, hidden: STATE.hidden, panels: STATE.panels });
+        } catch (e) {}
+    }
+
+    function colorText(bg) {
+        return [CHUTE_COLORS.SR, CHUTE_COLORS.FR0, CHUTE_COLORS.DD].includes(bg) ? "#ffffff" : "#111111";
+    }
+
+    function countClass(n) {
+        if (n >= CONFIG.severeRecircThreshold) return "fcv-pro-severe";
+        if (n >= CONFIG.recircThreshold) return "fcv-pro-warning";
+        return "fcv-pro-good";
+    }
+
+    function grafanaDisplayName(lane) {
+        const normalized = norm(lane).toUpperCase();
+        return GRAFANA_LANE_NAME_MAP[normalized] || normalized;
+    }
+
+    function grafanaLaneShouldDisplay(lane) {
+        const normalized = norm(lane).toUpperCase();
+
+        if (GRAFANA_LANE_NAME_MAP[normalized]) return true;
+        if (normalized.startsWith("SR-")) return true;
+        if (normalized.startsWith("FR-")) return true;
+        if (normalized.startsWith("DD")) return true;
+
+        // Hide raw sorter S-codes unless they are mapped to MJP/WJP/EJP/etc.
+        if (/^S\d{5,6}$/.test(normalized)) return false;
+
+        return false;
+    }
+
+    function isBlankOrDash(value) {
+        const text = lower(value);
+        return text === "" || text === "-" || text === "null" || text === "none";
+    }
+
+    function getBuildingFromUrl() {
+        const url = new URL(location.href);
+        const grafanaBuilding = url.searchParams.get("var-building");
+        if (grafanaBuilding) return grafanaBuilding;
+
+        const parts = location.pathname.split("/").filter(Boolean);
+        const idx = parts.indexOf("foresight");
+        return idx >= 0 && parts[idx + 1] ? parts[idx + 1] : "UNKNOWN";
+    }
+
+    function getSorterFromUrl() {
+        const url = new URL(location.href);
+        const sorter = url.searchParams.get("var-Sorter");
+        const subSorter = url.searchParams.get("var-Sub_Sorter");
+        if (sorter || subSorter) return [sorter, subSorter].filter(Boolean).join(" / ");
+
+        const parts = location.pathname.split("/").filter(Boolean);
+        return parts[parts.length - 1] || "UNKNOWN";
+    }
+
+    function getAnchor() {
+        const input =
+            document.querySelector('input[type="search"]') ||
+            Array.from(document.querySelectorAll("input")).find(i => {
+                const p = lower(i.getAttribute("placeholder"));
+                const a = lower(i.getAttribute("aria-label"));
+                return p.includes("search") || p.includes("filter") || a.includes("search");
+            });
+
+        if (input && input.parentElement) return { mode: "after", el: input.parentElement };
+
+        const table = document.querySelector("table");
+        const container = table && (table.closest(".awsui-table-container") || table.parentElement);
+        if (container) return { mode: "before", el: container };
+
+        return { mode: "body", el: document.body };
+    }
+
+    function insertAfterAnchor(element) {
+        const anchor = getAnchor();
+
+        if (anchor.mode === "after") anchor.el.insertAdjacentElement("afterend", element);
+        else if (anchor.mode === "before") anchor.el.parentElement.insertBefore(element, anchor.el);
+        else document.body.insertBefore(element, document.body.firstChild);
+    }
+
+
+    function gmGetJson(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url,
+                headers: {
+                    "Accept": "application/json, text/plain, */*"
+                },
+                onload: response => {
+                    try {
+                        resolve(JSON.parse(response.responseText));
+                    } catch (e) {
+                        reject(new Error("JSON parse failed: " + e.message + " | status " + response.status));
+                    }
+                },
+                onerror: error => reject(error)
+            });
+        });
+    }
+
+    function flattenPanels(panels, out = []) {
+        (panels || []).forEach(panel => {
+            if (panel.panels) {
+                flattenPanels(panel.panels, out);
+            } else {
+                out.push(panel);
+            }
+        });
+        return out;
+    }
+
+    async function runGrafanaDiagnostics() {
+        const diag = {
+            ranAt: new Date().toLocaleString(),
+            ranAtMs: Date.now(),
+            ok: false,
+            dashboardUid: "YIQVoijMk",
+            dashboardTitle: "",
+            panelCount: 0,
+            laneWatchPanels: [],
+            error: "",
+            location: location.href
+        };
+
+        try {
+            const data = await gmGetJson("https://grafana-prod.prod.us-east-1.grafana.insights.aft.amazon.dev/api/dashboards/uid/YIQVoijMk");
+            const dashboard = data.dashboard || {};
+            const panels = flattenPanels(dashboard.panels || []);
+
+            diag.ok = true;
+            diag.dashboardTitle = dashboard.title || "";
+            diag.panelCount = panels.length;
+            diag.laneWatchPanels = panels
+                .filter(panel => {
+                    const title = lower(panel.title || "");
+                    return title.includes("lane full") ||
+                           title.includes("lane unavailable") ||
+                           title.includes("failed to divert") ||
+                           title.includes("recirc");
+                })
+                .map(panel => ({
+                    id: panel.id,
+                    title: panel.title || "",
+                    type: panel.type || "",
+                    datasource: panel.datasource || null,
+                    targetCount: Array.isArray(panel.targets) ? panel.targets.length : 0,
+                    targets: (panel.targets || []).map(target => ({
+                        refId: target.refId,
+                        datasource: target.datasource || panel.datasource || null,
+                        queryType: target.queryType || "",
+                        rawSql: target.rawSql || "",
+                        expr: target.expr || "",
+                        streamReference: target.streamReference || ""
+                    }))
+                }));
+
+            GM_setValue(CONFIG.storage.grafanaDiag, diag);
+            return diag;
+        } catch (e) {
+            diag.error = String(e && e.message ? e.message : e);
+            GM_setValue(CONFIG.storage.grafanaDiag, diag);
+            return diag;
+        }
+    }
+
+    function getGrafanaDiagnostics() {
+        try {
+            return GM_getValue(CONFIG.storage.grafanaDiag, null);
+        } catch (e) {
+            return null;
+        }
+    }
+
+
+    // ---------- Grafana capture ----------
+
+    function laneLike(value) {
+        const text = norm(value).toUpperCase();
+        return /^S\d{5,6}$/.test(text) ||
+               /^SR-?\d{3,5}[A-Z-]*$/.test(text) ||
+               /^FR-?\d{3,5}[A-Z-]*$/.test(text) ||
+               /^DD-?\d{2,5}[A-Z-]*$/.test(text) ||
+               /^RECIRC$/.test(text);
+    }
+
+    function dedupeAndSort(items) {
+        const map = new Map();
+        items.forEach(item => {
+            if (!item.lane || !Number.isFinite(item.count)) return;
+            const old = map.get(item.lane);
+            if (!old || item.count > old.count) map.set(item.lane, item);
+        });
+        return Array.from(map.values()).sort((a, b) => b.count - a.count);
+    }
+
+    function parseLaneCountsFromText(text) {
+        const cleaned = String(text || "").replace(/\s+/g, " ");
+        const out = [];
+
+        const regex = /\b((?:S\d{5,6})|(?:SR-?\d{3,5}[A-Z-]*)|(?:FR-?\d{3,5}[A-Z-]*)|(?:DD-?\d{2,5}[A-Z-]*)|RECIRC)\b[\s:,-]*(\d{1,5})\b/gi;
+
+        let match;
+        while ((match = regex.exec(cleaned)) !== null) {
+            const lane = norm(match[1]).toUpperCase();
+            const count = Number(match[2]);
+
+            if (laneLike(lane) && Number.isFinite(count)) {
+                out.push({ lane, count });
+            }
+        }
+
+        // Fallback for Grafana layouts where lane and count are separated into
+        // adjacent text nodes/lines.
+        const lines = String(text || "").split(/\n+/).map(norm).filter(Boolean);
+        for (let i = 0; i < lines.length - 1; i++) {
+            const lane = lines[i].toUpperCase();
+            const count = Number(lines[i + 1]);
+
+            if (laneLike(lane) && Number.isFinite(count)) {
+                out.push({ lane, count });
+            }
+        }
+
+        return dedupeAndSort(out);
+    }
+
+    function parseGrafanaSection(text, keywords) {
+        const lines = text.split(/\n+/).map(norm).filter(Boolean);
+        const start = lines.findIndex(line => keywords.every(k => lower(line).includes(k)));
+
+        if (start < 0) {
+            return [];
+        }
+
+        const chunk = lines.slice(start, Math.min(lines.length, start + 140)).join("\n");
+        return parseLaneCountsFromText(chunk);
+    }
+
+    function getGrafanaPanelElements() {
+        const selectors = [
+            "[data-panelid]",
+            "[class*='panel-container']",
+            "[class*='panel-content']",
+            "[class*='react-grid-item']",
+            "[aria-label*='Panel']"
+        ];
+
+        const elements = Array.from(document.querySelectorAll(selectors.join(",")));
+
+        // Keep bigger text containers only.
+        return elements.filter(el => {
+            const text = norm(el.innerText || el.textContent || "");
+            return text.length > 20;
+        });
+    }
+
+    function scrapeGrafanaFromPanels() {
+        const panels = getGrafanaPanelElements();
+
+        const result = {
+            laneFull: [],
+            laneUnavailable: [],
+            failedToDivert: []
+        };
+
+        panels.forEach(panel => {
+            const text = panel.innerText || panel.textContent || "";
+            const ltext = lower(text);
+            const items = parseLaneCountsFromText(text);
+
+            if (!items.length) return;
+
+            if (ltext.includes("lane full")) {
+                result.laneFull = result.laneFull.concat(items);
+            }
+
+            if (ltext.includes("lane unavailable") || ltext.includes("disabled")) {
+                result.laneUnavailable = result.laneUnavailable.concat(items);
+            }
+
+            if (ltext.includes("failed to divert") || ltext.includes("mhe recirc")) {
+                result.failedToDivert = result.failedToDivert.concat(items);
+            }
+        });
+
+        return {
+            laneFull: dedupeAndSort(result.laneFull),
+            laneUnavailable: dedupeAndSort(result.laneUnavailable),
+            failedToDivert: dedupeAndSort(result.failedToDivert)
+        };
+    }
+
+    function showGrafanaBadge(message) {
+        let badge = document.getElementById(CONFIG.ids.grafanaBadge);
+        if (!badge) {
+            badge = document.createElement("div");
+            badge.id = CONFIG.ids.grafanaBadge;
+            document.body.appendChild(badge);
+        }
+        badge.textContent = `FCV Pro: ${message}`;
+    }
+
+    async function scrapeGrafanaLaneWatch() {
+        const diag = await runGrafanaDiagnostics();
+        const text = document.body ? document.body.innerText : "";
+        const panelData = scrapeGrafanaFromPanels();
+
+        let laneFull = panelData.laneFull;
+        let laneUnavailable = panelData.laneUnavailable;
+        let failedToDivert = panelData.failedToDivert;
+
+        // Fallback to body text if panel-specific parsing misses.
+        if (!laneFull.length) laneFull = parseGrafanaSection(text, ["lane", "full"]);
+        if (!laneUnavailable.length) laneUnavailable = parseGrafanaSection(text, ["lane", "unavailable"]);
+        if (!failedToDivert.length) failedToDivert = parseGrafanaSection(text, ["failed", "divert"]);
+
+        // Last resort: if Grafana gives us lane/count text but not the panel titles
+        // in the same DOM containers, place the generic list in Lane Full so at
+        // least the data becomes visible in Foresight.
+        const generic = parseLaneCountsFromText(text);
+        if (!laneFull.length && !laneUnavailable.length && !failedToDivert.length && generic.length) {
+            laneFull = generic;
+        }
+
+        const cache = {
+            source: "grafana",
+            building: getBuildingFromUrl(),
+            sorter: getSorterFromUrl(),
+            capturedAt: new Date().toLocaleString(),
+            capturedAtMs: Date.now(),
+            laneFull: dedupeAndSort(laneFull),
+            laneUnavailable: dedupeAndSort(laneUnavailable),
+            failedToDivert: dedupeAndSort(failedToDivert),
+            url: location.href,
+            signature: BUILD.signature,
+            debug: {
+                panelCount: getGrafanaPanelElements().length,
+                genericCount: generic.length,
+                bodyTextLength: text.length
+            }
+        };
+
+        const total = cache.laneFull.length + cache.laneUnavailable.length + cache.failedToDivert.length;
+
+        if (total) {
+            GM_setValue(CONFIG.storage.grafana, cache);
+            showGrafanaBadge(`Lane Watch cached: ${total} lanes`);
+            console.debug("[FCV Pro] Grafana cached", cache);
+        } else {
+            showGrafanaBadge(`No lane values. API ${diag.ok ? "OK" : "FAIL"} • panels ${diag.panelCount || 0} • watch panels ${(diag.laneWatchPanels || []).length}`);
+            console.debug("[FCV Pro] Grafana scrape found no data", cache, diag);
+        }
+    }
+
+    function getCachedGrafana() {
+        try {
+            return GM_getValue(CONFIG.storage.grafana, null);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // ---------- Foresight table helpers ----------
+
+    function getHeaderMap(table) {
+        const ths = Array.from(table.querySelectorAll("thead th"));
+        if (!ths.length) return null;
+
+        const map = {};
+        const headers = ths.map(th => norm(th.textContent));
+
+        ths.forEach((th, index) => {
+            const text = lower(th.textContent);
+            if (text.includes("chute")) map.chute = index;
+            if (text.includes("stacking filter")) map.stackingFilter = index;
+            if (text.includes("resources")) map.resources = index;
+            if (text.includes("slam received")) map.slamReceived = index;
+            if (text.includes("next cpt")) map.nextCpt = index;
+        });
+
+        if (!Number.isInteger(map.chute) ||
+            !Number.isInteger(map.stackingFilter) ||
+            !Number.isInteger(map.resources) ||
+            !Number.isInteger(map.slamReceived)) {
+            return null;
+        }
+
+        if (!Number.isInteger(map.nextCpt)) map.nextCpt = ths.length - 1;
+        map.headers = headers;
+        return map;
+    }
+
+    function getMainTable() {
+        return Array.from(document.querySelectorAll("table"))
+            .filter(table =>
+                !table.closest(`#${CONFIG.ids.allTable}`) &&
+                !table.closest(`#${CONFIG.ids.topRecirc}`) &&
+                !table.closest(`#${CONFIG.ids.allocations}`) &&
+                !table.closest(`#${CONFIG.ids.grafana}`)
+            )
+            .find(table => !!getHeaderMap(table)) || null;
+    }
+
+    function getFamilyFromText(chuteText, resourceText) {
+        const combined = `${resourceText || ""} ${chuteText || ""}`.toUpperCase();
+
+        if (combined.includes("SR-")) return { key: "SR", label: "Spirals", color: CHUTE_COLORS.SR };
+        if (combined.includes("FR-0")) return { key: "FR0", label: "High Velocity", color: CHUTE_COLORS.FR0 };
+        if (combined.includes("FR-1")) return { key: "FR1", label: "Flats", color: CHUTE_COLORS.FR1 };
+        if (combined.includes("FR-2")) return { key: "FR2", label: "High Velocity 2.0", color: CHUTE_COLORS.FR2 };
+        if (combined.includes("DD")) return { key: "DD", label: "Fluids", color: CHUTE_COLORS.DD };
+
+        return { key: "UNKNOWN", label: "Unknown", color: "" };
+    }
+
+    function getRecircFromText(text) {
+        // Only count the value inside parentheses from the
+        // "SLAM received (Recirc)" column.
+        //
+        // Example:
+        // "9 (8)"  -> 8
+        // "1"      -> 0
+        // "-"      -> 0
+        //
+        // This prevents the normal SLAM received count from being treated as recirc.
+        const t = norm(text);
+        const paren = t.match(/\((\d+)\)/);
+        return paren ? Number(paren[1]) : 0;
+    }
+
+    function unavailableText(text) {
+        const t = lower(text);
+        return t.includes("unavailable") || t.includes("not available") || t.includes("not_in_use") || t.includes("not in use");
+    }
+
+    function statusFor(disabled, unavailable, recircValue) {
+        if (disabled) return { key: "DISABLED", color: STATUS_COLORS.disabled, tooltip: "Disabled: blank stacking filter" };
+        if (recircValue >= CONFIG.recircThreshold) return { key: "RECIRC", color: STATUS_COLORS.recirc, tooltip: `High Recirc: ${recircValue}` };
+        if (unavailable) return { key: "UNAVAILABLE", color: STATUS_COLORS.unavailable, tooltip: "Unavailable" };
+        return { key: "AVAILABLE", color: STATUS_COLORS.available, tooltip: "Available" };
+    }
+
+    function laneLabel(chuteText, resourceText) {
+        if (resourceText && !isBlankOrDash(resourceText)) return resourceText;
+        if (chuteText && !isBlankOrDash(chuteText)) return chuteText;
+        return "Unknown lane";
+    }
+
+    function extractCurrentRows() {
+        const table = getMainTable();
+        if (!table) return { headers: STATE.headers, rows: [] };
+
+        const map = getHeaderMap(table);
+        if (!map) return { headers: STATE.headers, rows: [] };
+
+        STATE.headers = map.headers;
+
+        const rows = Array.from(table.querySelectorAll("tbody tr"));
+        const extracted = [];
+
+        rows.forEach(row => {
+            if (!row.children || row.children.length <= map.slamReceived) return;
+
+            const cells = Array.from(row.children).map(cell => norm(cell.textContent));
+            const chuteText = cells[map.chute] || "";
+            const stackingFilterText = cells[map.stackingFilter] || "";
+            const resourceText = cells[map.resources] || "";
+            const recircText = cells[map.slamReceived] || "";
+
+            const disabled = isBlankOrDash(stackingFilterText);
+            const recircValue = getRecircFromText(recircText);
+            const unavailable = unavailableText(cells.join(" "));
+            const family = getFamilyFromText(chuteText, resourceText);
+            const label = laneLabel(chuteText, resourceText);
+            const status = statusFor(disabled, unavailable, recircValue);
+
+            if (label === "Unknown lane") return;
+
+            extracted.push({
+                cells,
+                chuteText,
+                stackingFilterText,
+                resourceText,
+                recircValue,
+                unavailable,
+                disabled,
+                family,
+                laneLabel: label,
+                status
+            });
+        });
+
+        return { headers: map.headers, rows: extracted, map };
+    }
+
+
+    function findBestHeaderMapFromDocument() {
+        const tables = Array.from(document.querySelectorAll("table"));
+        let best = null;
+
+        for (const table of tables) {
+            const map = getHeaderMap(table);
+            if (map && (!best || (map.headers || []).length > (best.headers || []).length)) {
+                best = map;
+            }
+        }
+
+        return best;
+    }
+
+    function extractAllForesightRowsFromDOM() {
+        const map = findBestHeaderMapFromDocument();
+        if (!map) return { headers: STATE.headers, rows: [] };
+
+        STATE.headers = map.headers || STATE.headers;
+
+        const rows = [];
+        const seen = new Set();
+        const allRows = Array.from(document.querySelectorAll("table tbody tr, [role='row']"));
+
+        allRows.forEach(row => {
+            if (row.closest && row.closest("[id^='fcv-pro-']")) return;
+
+            const cellElements = Array.from(row.querySelectorAll("td, [role='cell']"));
+            if (!cellElements.length) return;
+
+            const cells = cellElements.map(cell => norm(cell.textContent));
+            if (cells.length <= Math.max(map.chute, map.stackingFilter, map.resources, map.slamReceived)) return;
+
+            const chuteText = cells[map.chute] || "";
+            const stackingFilterText = cells[map.stackingFilter] || "";
+            const resourceText = cells[map.resources] || "";
+            const recircText = cells[map.slamReceived] || "";
+
+            if (!chuteText && !resourceText && !stackingFilterText) return;
+
+            const family = getFamilyFromText(chuteText, resourceText);
+            if (family.key === "UNKNOWN") return;
+
+            const label = laneLabel(chuteText, resourceText);
+            if (label === "Unknown lane") return;
+
+            const key = `${label}|${chuteText}|${stackingFilterText}|${recircText}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+
+            const disabled = isBlankOrDash(stackingFilterText);
+            const recircValue = getRecircFromText(recircText);
+            const unavailable = unavailableText(cells.join(" "));
+            const status = statusFor(disabled, unavailable, recircValue);
+
+            rows.push({
+                cells,
+                chuteText,
+                stackingFilterText,
+                resourceText,
+                recircValue,
+                unavailable,
+                disabled,
+                family,
+                laneLabel: label,
+                status
+            });
+        });
+
+        return { headers: map.headers, rows, map };
+    }
+
+    function refreshFullDomLaneCache() {
+        const all = extractAllForesightRowsFromDOM();
+        if (all.rows && all.rows.length) addRowsToCache(all.rows);
+        return all;
+    }
+
+
+    function rowKey(row) {
+        return `${row.laneLabel}|${row.chuteText}|${row.stackingFilterText}`;
+    }
+
+    function addRowsToCache(rows) {
+        rows.forEach(row => STATE.laneCache.set(rowKey(row), row));
+    }
+
+    function getCachedRows() {
+        const current = extractCurrentRows();
+        addRowsToCache(current.rows);
+        return {
+            headers: STATE.headers.length ? STATE.headers : current.headers,
+            rows: Array.from(STATE.laneCache.values())
+        };
+    }
+
+    function filterPass(familyKey, disabled, recircValue) {
+        // Legend filters were removed in v18. Keep all rows visible.
+        return true;
+    }
+
+    // ---------- Allocations ----------
+
+    function shortAllocationStatus(statusText) {
+        const status = norm(statusText);
+        const lowered = lower(statusText);
+
+        if (lowered.includes("pending") && lowered.includes("container") && lowered.includes("open")) return "Pending Open";
+        if (lowered.includes("container") && lowered.includes("open")) return "Pending Open";
+        if (lowered.includes("completed") || lowered.includes("complete")) return "Completed";
+        if (lowered.includes("allocated")) return "Allocated";
+        if (lowered.includes("cancelled") || lowered.includes("canceled")) return "Cancelled";
+        if (lowered.includes("failed") || lowered.includes("error")) return "Failed";
+
+        return status;
+    }
+
+    function getStatusColor(statusText) {
+        const status = lower(statusText);
+
+        // Allocation page-style color logic:
+        // green = done/allocated, yellow = pending, orange = open/in-progress,
+        // red = cancelled/failed/problem.
+        if (status.includes("completed") || status.includes("complete")) return "#22C55E";
+        if (status.includes("pending") && status.includes("container") && status.includes("open")) return "#FACC15";
+        if (status.includes("pending")) return "#FACC15";
+        if (status.includes("allocated") && status.includes("container") && status.includes("open")) return "#FACC15";
+        if (status.includes("allocated")) return "#22C55E";
+        if (status.includes("container") && status.includes("open")) return "#FACC15";
+        if (status.includes("executing") || status.includes("in progress")) return "#F59E0B";
+        if (status.includes("cancelled") || status.includes("canceled")) return "#D13212";
+        if (status.includes("failed") || status.includes("error")) return "#D13212";
+
+        return "#E5E5E5";
+    }
+
+    function allocationHeaderMap(table) {
+        const headers = Array.from(table.querySelectorAll("thead th"));
+        if (!headers.length) return null;
+
+        const map = {};
+        headers.forEach((header, index) => {
+            const text = lower(header.textContent);
+
+            if (text.includes("stacking filter")) map.stackingFilter = index;
+            if (text.includes("proposed allocation")) map.proposedAllocation = index;
+            if (text.includes("current allocation")) map.currentAllocation = index;
+            if (text === "status" || text.includes("status")) map.status = index;
+        });
+
+        if (!Number.isInteger(map.stackingFilter) || !Number.isInteger(map.status)) return null;
+
+        if (!Number.isInteger(map.proposedAllocation)) {
+            // Fallback for the Auto Recommendations table in case AWSUI text wrapping
+            // causes header detection to fail.
+            map.proposedAllocation = 9;
+        }
+
+        return map;
+    }
+
+    function chuteFromProposed(text) {
+        const proposed = norm(text);
+        const patterns = [/\bSR-\d{3,5}-?[A-Z]?\b/i, /\bFR-\d{3,5}\b/i, /\bDD-?\d{2,5}\b/i, /\bDD\d{2,5}\b/i];
+        for (const pattern of patterns) {
+            const match = proposed.match(pattern);
+            if (match) return match[0].toUpperCase();
+        }
+        return proposed || "Unknown chute";
+    }
+
+    function allocationFamilyFromChute(chute) {
+        const text = norm(chute).toUpperCase();
+
+        if (text.includes("SR-")) return { key: "SR", order: 1, color: CHUTE_COLORS.SR, label: "Spirals" };
+        if (text.includes("FR-1")) return { key: "FR1", order: 2, color: CHUTE_COLORS.FR1, label: "Flats" };
+        if (text.includes("FR-0")) return { key: "FR0", order: 3, color: CHUTE_COLORS.FR0, label: "High Velocity" };
+        if (text.includes("FR-2")) return { key: "FR2", order: 4, color: CHUTE_COLORS.FR2, label: "High Velocity 2.0" };
+        if (text.includes("DD")) return { key: "DD", order: 5, color: CHUTE_COLORS.DD, label: "Fluids" };
+
+        return { key: "UNKNOWN", order: 99, color: "#E5E5E5", label: "Unknown" };
+    }
+
+    function extractAllocationMetaFromDocument(doc = document) {
+        const text = doc.body ? doc.body.innerText : "";
+
+        const nextMatch = text.match(/Next automatic recommendations in\s*([0-9]{1,2}:[0-9]{2})/i);
+        const lastMatch = text.match(/Last recommendations generated at\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}:\d{2}\s+[A-Z]{2,4})/i);
+
+        return {
+            nextAutomaticRecommendation: nextMatch ? cleanAllocationTimerText(nextMatch[1]) : "",
+            lastRecommendationsGeneratedAt: lastMatch ? cleanLastGeneratedText(lastMatch[1]) : "",
+            capturedAt: new Date().toLocaleString(),
+            capturedAtMs: Date.now()
+        };
+    }
+
+    function extractAllocationMetaFromPage() {
+        return extractAllocationMetaFromDocument(document);
+    }
+
+    function extractAllocationsFromDocument(doc = document) {
+        const tables = Array.from(doc.querySelectorAll("table"));
+        const allocations = [];
+
+        tables.forEach(table => {
+            const map = allocationHeaderMap(table);
+            if (!map) return;
+
+            Array.from(table.querySelectorAll("tbody tr")).forEach(row => {
+                const cells = Array.from(row.children).map(cell => norm(cell.textContent));
+                if (cells.length <= Math.max(map.stackingFilter, map.proposedAllocation, map.status)) return;
+
+                const stackingFilter = cells[map.stackingFilter] || "";
+                let proposedAllocation = cells[map.proposedAllocation] || "";
+                let status = cells[map.status] || "";
+
+                if (!proposedAllocation) {
+                    proposedAllocation = cells.find(c =>
+                        /\b(add|remove|check)\b/i.test(c) &&
+                        /\b(SR-|FR-|DD)/i.test(c)
+                    ) || "";
+                }
+
+                if (!status) {
+                    status = cells.find(c =>
+                        /completed|pending|allocated|container open|container close|cancelled|canceled|failed|executing|in progress|check for missorts/i.test(c)
+                    ) || "";
+                }
+
+                if (!stackingFilter || !proposedAllocation || !status) return;
+                if (lower(stackingFilter).includes("dependent recommendation")) return;
+
+                const chute = chuteFromProposed(proposedAllocation);
+                const family = allocationFamilyFromChute(chute);
+
+                allocations.push({
+                    stackingFilter,
+                    chute,
+                    proposedAllocation,
+                    status,
+                    statusColor: getStatusColor(status),
+                    family,
+                    capturedAt: new Date().toLocaleString()
+                });
+            });
+        });
+
+        allocations.sort((a, b) => {
+            const fa = a.family || allocationFamilyFromChute(a.chute);
+            const fb = b.family || allocationFamilyFromChute(b.chute);
+            if (fa.order !== fb.order) return fa.order - fb.order;
+            return String(a.chute).localeCompare(String(b.chute));
+        });
+
+        const meta = extractAllocationMetaFromDocument(doc);
+
+        if (allocations.length || meta.nextAutomaticRecommendation || meta.lastRecommendationsGeneratedAt) {
+            GM_setValue(CONFIG.storage.allocations, {
+                meta,
+                items: allocations
+            });
+        }
+
+        return { meta, items: allocations };
+    }
+
+    function extractAllocationsFromPage() {
+        const result = extractAllocationsFromDocument(document);
+        return result.items;
+    }
+
+    function getCachedAllocations() {
+        if (isAllocationPage()) {
+            const current = extractAllocationsFromDocument(document);
+            if ((current.items || []).length || current.meta.nextAutomaticRecommendation || current.meta.lastRecommendationsGeneratedAt) {
+                return current;
+            }
+        }
+
+        try {
+            const cached = GM_getValue(CONFIG.storage.allocations, { meta: {}, items: [] });
+            if (Array.isArray(cached)) return { meta: {}, items: cached };
+            return cached || { meta: {}, items: [] };
+        } catch (e) {
+            return { meta: {}, items: [] };
+        }
+    }
+
+    function getAllocationUrl() {
+        const building = getBuildingFromUrl();
+        return `https://sort.aka.amazon.com/foresight/${building}/CrossBeltSorterAutoRecommendations`;
+    }
+
+    function refreshAllocationsHiddenFrame() {
+        if (isAllocationPage()) {
+            extractAllocationsFromDocument(document);
+            return;
+        }
+
+        let frame = document.getElementById(CONFIG.ids.allocationFrame);
+        if (!frame) {
+            frame = document.createElement("iframe");
+            frame.id = CONFIG.ids.allocationFrame;
+            document.body.appendChild(frame);
+
+            frame.addEventListener("load", () => {
+                try {
+                    const doc = frame.contentDocument || frame.contentWindow.document;
+                    extractAllocationsFromDocument(doc);
+                    renderAll();
+                } catch (e) {
+                    console.debug("[FCV Pro] Hidden allocation frame scrape failed", e);
+                }
+            });
+        }
+
+        frame.src = getAllocationUrl() + `?fcvRefresh=${Date.now()}`;
+    }
+
+
+    function cleanAllocationTimerText(value) {
+        const text = norm(value);
+        const match = text.match(/[0-9]{1,2}:[0-9]{2}/);
+        return match ? match[0] : "";
+    }
+
+    function cleanLastGeneratedText(value) {
+        const text = norm(value);
+        const match = text.match(/[A-Za-z]{3}\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}:\d{2}\s+[A-Z]{2,4}/);
+        return match ? match[0] : "";
+    }
+
+    function secondsUntilNextFiveMinuteReset() {
+        const now = new Date();
+        const seconds = now.getSeconds();
+        const minutes = now.getMinutes();
+        const nextMinute = Math.ceil((minutes + (seconds > 0 ? 1 : 0)) / 5) * 5;
+        const next = new Date(now);
+
+        if (nextMinute >= 60) {
+            next.setHours(now.getHours() + 1, 0, 0, 0);
+        } else {
+            next.setMinutes(nextMinute, 0, 0);
+            if (next <= now) next.setMinutes(next.getMinutes() + 5);
+        }
+
+        return Math.max(0, Math.round((next - now) / 1000));
+    }
+
+    function formatDuration(seconds) {
+        const s = Math.max(0, Number(seconds) || 0);
+        const m = Math.floor(s / 60);
+        const r = String(s % 60).padStart(2, "0");
+        return `${m}:${r}`;
+    }
+
+    function severityClass(value) {
+        if (value >= CONFIG.severeRecircThreshold) return "fcv-pro-top-severe";
+        if (value >= CONFIG.recircThreshold) return "fcv-pro-top-warning";
+        return "fcv-pro-top-good";
+    }
+
+
+    // ---------- UI render ----------
+    // ---------- UI render ----------
+
+    function ensureControlBar() {
+        let bar = document.getElementById(CONFIG.ids.control);
+        if (bar) return bar;
+
+        bar = document.createElement("div");
+        bar.id = CONFIG.ids.control;
+        insertAfterAnchor(bar);
+        return bar;
+    }
+
+
+    function hideEverything() {
+        STATE.collapsed = true;
+        STATE.hidden = false;
+        savePrefs();
+        renderAll();
+    }
+
+    function showEverything() {
+        STATE.hidden = false;
+        savePrefs();
+        renderAll();
+    }
+
+    function ensureShowTab() {
+        let tab = document.getElementById("fcv-pro-show-tab");
+
+        if (tab) tab.remove();
+        return;
+
+        if (!tab) {
+            tab = document.createElement("button");
+            tab.id = "fcv-pro-show-tab";
+            tab.textContent = "Show FCV Pro";
+            document.body.appendChild(tab);
+            tab.addEventListener("click", showEverything);
+        }
+    }
+
+    function toggleMasterCollapse() {
+        STATE.collapsed = !STATE.collapsed;
+        savePrefs();
+        renderAll();
+    }
+
+    function cleanFloatingForesightStickyElements() {
+        // Do NOT rewrite AWSUI table positioning anymore. That caused duplicate headers.
+        // Only hide duplicate cloned header rows if AWSUI renders two identical column rows.
+        const rows = Array.from(document.querySelectorAll("table tr, [role='row']"));
+        let headerSeen = false;
+
+        rows.forEach(row => {
+            if (row.closest && row.closest("[id^='fcv-pro-']")) return;
+
+            const text = norm(row.textContent || "");
+            const looksLikeColumnHeader =
+                text.includes("Chute") &&
+                text.includes("Stacking Filter") &&
+                text.includes("Resources") &&
+                text.includes("SLAM received") &&
+                text.includes("Next CPT");
+
+            if (!looksLikeColumnHeader) return;
+
+            if (!headerSeen) {
+                headerSeen = true;
+                row.style.removeProperty("display");
+            } else {
+                row.style.setProperty("display", "none", "important");
+            }
+        });
+
+        // Avoid nested scrollbars from AWSUI wrappers when possible.
+        document.querySelectorAll(".awsui-table-container, [class*='awsui-table-container']").forEach(el => {
+            if (el.closest && el.closest("[id^='fcv-pro-']")) return;
+            el.style.setProperty("overflow", "visible", "important");
+            el.style.setProperty("max-height", "none", "important");
+        });
+
+        document.documentElement.style.overflowY = "auto";
+        document.body.style.overflowY = "auto";
+    }
+
+
+    function updateToolbarOffset() {
+        const bar = document.getElementById(CONFIG.ids.control);
+        if (!bar) return;
+
+        const height = Math.ceil(bar.getBoundingClientRect().height || 44);
+        const offset = Math.max(50, height + 10);
+
+        document.documentElement.style.setProperty("--fcv-pro-toolbar-height", `${offset}px`);
+        document.body.classList.add("fcv-pro-has-fixed-bar");
+        document.body.style.paddingTop = `${offset}px`;
+    }
+    async function silentScanAllPagesForTopRecirc() {
+        refreshFullDomLaneCache();
+    }
+
+    function renderControlBar() {
+        const bar = ensureControlBar();
+        STATE.hidden = false;
+        STATE.panels.allTable = false;
+        STATE.panels.legend = false;
+        bar.classList.toggle("fcv-pro-collapsed", STATE.collapsed);
+
+        bar.innerHTML = `
+            <span class="fcv-pro-left-controls">
+                <button id="fcv-pro-collapse-toggle">${STATE.collapsed ? "Expand All" : "Collapse All"}</button>
+                <span class="fcv-pro-inline-legend">
+                    <span><b style="background:#8E44AD"></b>Spirals</span>
+                    <span><b style="background:#00A6D6"></b>Flats</span>
+                    <span><b style="background:#E67E22"></b>HV</span>
+                    <span><b style="background:#F1C40F"></b>HV 2.0</span>
+                    <span><b style="background:#1F4E79"></b>Fluids</span>
+                    <span><b style="background:#90EE90"></b>Available</span>
+                    <span><b style="background:#66A3FF"></b>Recirc</span>
+                    <span><b style="background:#A9A9A9"></b>Disabled</span>
+                </span>
+            </span>
+            <span class="fcv-pro-right-controls">
+                <button data-panel="grafana">Grafana</button>
+                <button data-panel="allocations">Allocations</button>
+                <button data-panel="topRecirc">Top Recirc</button>
+                <button id="fcv-pro-refresh-grafana">Refresh Grafana</button>
+                <button id="fcv-pro-refresh-allocations">Refresh Allocations</button>
+            </span>
+        `;
+
+        const collapseToggle = document.getElementById("fcv-pro-collapse-toggle");
+        if (collapseToggle) {
+            collapseToggle.addEventListener("click", toggleMasterCollapse);
+        }
+
+        Array.from(bar.querySelectorAll("button[data-panel]")).forEach(button => {
+            const key = button.dataset.panel;
+            button.classList.toggle("fcv-pro-active", !!STATE.panels[key]);
+            button.classList.toggle("fcv-pro-off", !STATE.panels[key]);
+            button.addEventListener("click", () => {
+                STATE.panels[key] = !STATE.panels[key];
+                savePrefs();
+                renderAll();
+            });
+        });
+
+        const refreshGrafana = document.getElementById("fcv-pro-refresh-grafana");
+        if (refreshGrafana) {
+            refreshGrafana.addEventListener("click", async () => {
+                refreshGrafana.textContent = "Refreshing...";
+                refreshGrafana.disabled = true;
+                try {
+                    await runGrafanaDiagnostics();
+                    if (isGrafanaPage()) {
+                        await scrapeGrafanaLaneWatch();
+                    }
+                } finally {
+                    refreshGrafana.disabled = false;
+                    renderAll();
+                }
+            });
+        }
+
+        updateToolbarOffset();
+        cleanFloatingForesightStickyElements();
+
+        const refreshAllocations = document.getElementById("fcv-pro-refresh-allocations");
+        if (refreshAllocations) {
+            refreshAllocations.addEventListener("click", () => {
+                refreshAllocations.textContent = "Refreshing...";
+                refreshAllocations.disabled = true;
+                try {
+                    if (typeof refreshAllocationsHiddenFrame === "function") {
+                        refreshAllocationsHiddenFrame();
+                    } else {
+                        extractAllocationsFromPage();
+                    }
+                } finally {
+                    refreshAllocations.disabled = false;
+                    renderAll();
+                }
+            });
+        }
+    }
+
+
+    function toggleFilter(filter) {
+        if (filter === "ALL") {
+            STATE.filters.recircOnly = false;
+            STATE.filters.hideDisabled = false;
+            STATE.filters.families.clear();
+        } else if (filter === "RECIRC") {
+            STATE.filters.recircOnly = !STATE.filters.recircOnly;
+        } else if (filter === "HIDE_DISABLED") {
+            STATE.filters.hideDisabled = !STATE.filters.hideDisabled;
+        } else if (AREA_ORDER.includes(filter)) {
+            if (STATE.filters.families.has(filter)) STATE.filters.families.delete(filter);
+            else STATE.filters.families.add(filter);
+        }
+
+        renderAll();
+    }
+
+    function filterActive(filter) {
+        if (filter === "ALL") return !STATE.filters.recircOnly && !STATE.filters.hideDisabled && STATE.filters.families.size === 0;
+        if (filter === "RECIRC") return STATE.filters.recircOnly;
+        if (filter === "HIDE_DISABLED") return STATE.filters.hideDisabled;
+        if (AREA_ORDER.includes(filter)) return STATE.filters.families.has(filter);
+        return false;
+    }
+
+    function renderLegend() {
+        let legend = document.getElementById(CONFIG.ids.legend);
+        if (!STATE.panels.legend) {
+            if (legend) legend.remove();
+            return;
+        }
+
+        if (!legend) {
+            legend = document.createElement("div");
+            legend.id = CONFIG.ids.legend;
+            document.getElementById(CONFIG.ids.control).insertAdjacentElement("afterend", legend);
+        }
+
+        legend.innerHTML = `
+            <span><b style="background:${CHUTE_COLORS.SR}"></b>Spirals</span>
+            <span><b style="background:${CHUTE_COLORS.FR1}"></b>Flats</span>
+            <span><b style="background:${CHUTE_COLORS.FR0}"></b>HV</span>
+            <span><b style="background:${CHUTE_COLORS.FR2}"></b>HV 2.0</span>
+            <span><b style="background:${CHUTE_COLORS.DD}"></b>Fluids</span>
+            <span><b style="background:${STATUS_COLORS.available}"></b>Available</span>
+            <span><b style="background:${STATUS_COLORS.recirc}"></b>Recirc 10+</span>
+            <span><b style="background:${STATUS_COLORS.unavailable}"></b>Unavailable</span>
+            <span><b style="background:${STATUS_COLORS.disabled}"></b>Disabled</span>
+
+        `;
+
+
+    }
+
+    function panelAfterPrevious(id) {
+        let existing = document.getElementById(id);
+        if (existing) return existing;
+
+        const panel = document.createElement("div");
+        panel.id = id;
+        panel.className = "fcv-pro-panel";
+
+        const order = [CONFIG.ids.legend, CONFIG.ids.grafana, CONFIG.ids.allocations, CONFIG.ids.topRecirc, CONFIG.ids.allTable];
+        const index = order.indexOf(id);
+        let inserted = false;
+
+        for (let i = index - 1; i >= 0; i--) {
+            const prev = document.getElementById(order[i]);
+            if (prev) {
+                prev.insertAdjacentElement("afterend", panel);
+                inserted = true;
+                break;
+            }
+        }
+
+        if (!inserted) {
+            document.getElementById(CONFIG.ids.control).insertAdjacentElement("afterend", panel);
+        }
+
+        return panel;
+    }
+
+    function renderGrafanaPanel() {
+        let panel = document.getElementById(CONFIG.ids.grafana);
+        if (!STATE.panels.grafana) {
+            if (panel) panel.remove();
+            return;
+        }
+
+        panel = panelAfterPrevious(CONFIG.ids.grafana);
+
+        const cache = getCachedGrafana();
+        console.debug("[FCV Pro] Grafana cache", cache);
+        if (!cache) {
+            const diag = getGrafanaDiagnostics();
+            const diagText = diag
+                ? `API ${diag.ok ? "OK" : "FAIL"} • Panels ${diag.panelCount || 0} • Lane Watch Panels ${(diag.laneWatchPanels || []).length}${diag.error ? " • " + diag.error : ""}`
+                : "No diagnostics yet.";
+
+            panel.innerHTML = `
+                <div class="fcv-pro-panel-title">Grafana Lane Watch</div>
+                <div class="fcv-pro-panel-subtitle">No Grafana cache yet. ${escapeHtml(diagText)}</div>
+                <div class="fcv-pro-actions">
+                    <button id="fcv-pro-refresh-grafana-panel">Refresh Grafana</button>
+                </div>
+            `;
+
+            document.getElementById("fcv-pro-refresh-grafana-panel")?.addEventListener("click", async () => {
+                await runGrafanaDiagnostics();
+                renderAll();
+            });
+            return;
+        }
+
+        const age = Math.max(0, Math.round((Date.now() - Number(cache.capturedAtMs || 0)) / 1000));
+        const ageText = age < 60 ? `${age}s ago` : `${Math.round(age / 60)}m ago`;
+
+        panel.innerHTML = `
+            <div class="fcv-pro-panel-title fcv-pro-title-row">
+                <span class="fcv-pro-title-main">Grafana Lane Watch</span>
+                <span class="fcv-pro-title-pill">Updated ${escapeHtml(ageText)} • Resets in ${escapeHtml(formatDuration(secondsUntilNextFiveMinuteReset()))}</span>
+            </div>
+            <div class="fcv-pro-panel-subtitle"></div>
+            <div class="fcv-pro-grid">
+                ${renderGrafanaSection("Lane Full (Ops Recirc)", cache.laneFull)}
+                ${renderGrafanaSection("Unavailable / Disabled (Ops Recirc)", cache.laneUnavailable)}
+            </div>
+
+        `;
+
+    }
+
+    function renderGrafanaSection(title, items) {
+        const limited = (items || [])
+            .filter(item => grafanaLaneShouldDisplay(item.lane))
+            .slice(0, CONFIG.maxGrafanaItems);
+        const html = limited.length
+            ? limited.map(item => `
+                <div class="fcv-pro-item ${countClass(item.count)}-row" title="${escapeHtml(grafanaDisplayName(item.lane))}: ${item.count}">
+                    <span class="fcv-pro-item-name">${escapeHtml(grafanaDisplayName(item.lane))}</span>
+                    <span class="fcv-pro-item-count ${countClass(item.count)}">${item.count}</span>
+                </div>
+            `).join("")
+            : `<div class="fcv-pro-empty">No data</div>`;
+
+        return `
+            <div class="fcv-pro-card">
+                <div class="fcv-pro-card-title">${escapeHtml(title)}</div>
+                <div class="fcv-pro-list">${html}</div>
+            </div>
+        `;
+    }
+
+    function renderAllocationsPanel() {
+        let panel = document.getElementById(CONFIG.ids.allocations);
+        if (!STATE.panels.allocations) {
+            if (panel) panel.remove();
+            return;
+        }
+
+        panel = panelAfterPrevious(CONFIG.ids.allocations);
+        const allocationCache = getCachedAllocations();
+        const allocations = allocationCache.items || [];
+        const meta = allocationCache.meta || {};
+
+        const metaText = "";
+
+        const grouped = { SR: [], FR1: [], FR0: [], FR2: [], DD: [] };
+        allocations.forEach(item => {
+            const family = item.family || allocationFamilyFromChute(item.chute);
+            if (grouped[family.key]) grouped[family.key].push(item);
+        });
+
+        const header = CONFIG.allocationAreaOrder.map(key => `
+            <th style="background:${CHUTE_COLORS[key]}; color:${colorText(CHUTE_COLORS[key])};">
+                ${AREA_LABELS[key]}
+            </th>
+        `).join("");
+
+        const body = CONFIG.allocationAreaOrder.map(key => {
+            const items = grouped[key] || [];
+
+            if (!items.length) {
+                return `<td><div class="fcv-pro-allocation-empty-area">No allocations</div></td>`;
+            }
+
+            return `<td>${items.map(item => {
+                const family = item.family || allocationFamilyFromChute(item.chute);
+                const chuteColor = family.color || "#E5E5E5";
+                const textColor = colorText(chuteColor);
+
+                return `
+                    <div class="fcv-pro-allocation-card">
+                        <div class="fcv-pro-allocation-topline">
+                            <span class="fcv-pro-allocation-chute" style="background:${chuteColor}; color:${textColor}" title="${escapeHtml(family.label)}">
+                                ${escapeHtml(item.chute)}
+                            </span>
+                            <span class="fcv-pro-status-pill" style="background:${item.statusColor}">
+                                ${escapeHtml(shortAllocationStatus(item.status))}
+                            </span>
+                        </div>
+                        <div class="fcv-pro-subtext">${escapeHtml(item.proposedAllocation)}</div>
+                    </div>
+                `;
+            }).join("")}</td>`;
+        }).join("");
+
+        const nextTimer = cleanAllocationTimerText(meta.nextAutomaticRecommendation || "");
+        const lastGenerated = cleanLastGeneratedText(meta.lastRecommendationsGeneratedAt || "");
+        const allocationPill = nextTimer
+            ? `Next recommendation in ${nextTimer}`
+            : "Next recommendation --";
+
+        panel.innerHTML = `
+            <div class="fcv-pro-panel-title fcv-pro-title-row">
+                <span class="fcv-pro-title-main">Allocations</span>
+                <span class="fcv-pro-title-meta">Generated ${escapeHtml(lastGenerated || "--")}</span>
+                <span class="fcv-pro-title-pill">${escapeHtml(allocationPill)}</span>
+            </div>
+            <div class="fcv-pro-allocation-meta"></div>
+            <table class="fcv-pro-allocation-area-table">
+                <thead><tr>${header}</tr></thead>
+                <tbody><tr>${body}</tr></tbody>
+            </table>
+        `;
+    }
+
+
+    function summary(row) {
+        return {
+            familyKey: row.family.key,
+            familyLabel: row.family.label,
+            laneLabel: row.laneLabel,
+            recircValue: row.recircValue,
+            disabled: row.disabled
+        };
+    }
+
+    function renderTopRecircPanel(rows) {
+        let panel = document.getElementById(CONFIG.ids.topRecirc);
+        if (!STATE.panels.topRecirc) {
+            if (panel) panel.remove();
+            return;
+        }
+
+        panel = panelAfterPrevious(CONFIG.ids.topRecirc);
+
+        const grouped = { SR: [], FR1: [], FR0: [], FR2: [], DD: [] };
+        rows.map(summary).forEach(lane => {
+            if (!lane || lane.disabled) return;
+            if (!grouped[lane.familyKey]) return;
+            if (lane.recircValue <= 0) return;
+            grouped[lane.familyKey].push(lane);
+        });
+
+        const areaRow = AREA_ORDER.map(key => `<th style="background:${CHUTE_COLORS[key]};color:white">${AREA_LABELS[key]}</th>`).join("");
+        const laneRow = AREA_ORDER.map(key => {
+            const top = grouped[key].sort((a, b) => b.recircValue - a.recircValue).slice(0, CONFIG.maxTopRecircItems);
+            const content = top.length
+                ? top.map((lane, i) => `
+                    <div class="fcv-pro-top-line ${severityClass(lane.recircValue)}" title="${escapeHtml(lane.laneLabel)}: ${lane.recircValue}">
+                        <span class="fcv-pro-top-lane">${i + 1}. ${escapeHtml(lane.laneLabel)}</span>
+                        <span class="fcv-pro-top-count">${lane.recircValue}</span>
+                    </div>
+                `).join("")
+                : `<div class="fcv-pro-empty">No recirc</div>`;
+            return `<td style="color:${CHUTE_COLORS[key]}">${content}</td>`;
+        }).join("");
+
+        panel.innerHTML = `
+            <div class="fcv-pro-panel-title">Top Recirculating Lanes by Area</div>
+            <table>
+                <thead><tr class="fcv-pro-area-row">${areaRow}</tr></thead>
+                <tbody><tr>${laneRow}</tr></tbody>
+            </table>
+        `;
+    }
+
+    function headerMapFromHeaders(headers) {
+        const map = {};
+        headers.forEach((header, index) => {
+            const text = lower(header);
+            if (text.includes("chute")) map.chute = index;
+            if (text.includes("stacking filter")) map.stackingFilter = index;
+            if (text.includes("resources")) map.resources = index;
+            if (text.includes("slam received")) map.slamReceived = index;
+            if (text.includes("next cpt")) map.nextCpt = index;
+        });
+        if (!Number.isInteger(map.chute) || !Number.isInteger(map.resources) || !Number.isInteger(map.slamReceived)) return null;
+        if (!Number.isInteger(map.nextCpt)) map.nextCpt = headers.length - 1;
+        return map;
+    }
+
+    function sortRows(rows) {
+        if (STATE.sortIndex === null) return rows;
+
+        const index = STATE.sortIndex;
+        const dir = STATE.sortDirection === "asc" ? 1 : -1;
+
+        return [...rows].sort((a, b) => {
+            const av = a.cells[index] ?? "";
+            const bv = b.cells[index] ?? "";
+            const an = Number(String(av).replace(/[^\d.-]/g, ""));
+            const bn = Number(String(bv).replace(/[^\d.-]/g, ""));
+            if (Number.isFinite(an) && Number.isFinite(bn) && (String(av).match(/\d/) || String(bv).match(/\d/))) return (an - bn) * dir;
+            return String(av).localeCompare(String(bv)) * dir;
+        });
+    }
+
+    function handleSort(index) {
+        if (STATE.sortIndex === index) STATE.sortDirection = STATE.sortDirection === "asc" ? "desc" : "asc";
+        else {
+            STATE.sortIndex = index;
+            STATE.sortDirection = "desc";
+        }
+        renderAll();
+    }
+
+    function renderAllTable(cached) {
+        let panel = document.getElementById(CONFIG.ids.allTable);
+        document.body.classList.remove("fcv-pro-all-mode");
+
+        if (!STATE.panels.allTable) {
+            if (panel) panel.remove();
+            return;
+        }
+
+        panel = panelAfterPrevious(CONFIG.ids.allTable);
+        const headers = cached.headers || STATE.headers || [];
+        const map = headerMapFromHeaders(headers);
+        const visibleRows = sortRows(cached.rows.filter(row => filterPass(row.family.key, row.disabled, row.recircValue)));
+
+        panel.innerHTML = `
+            <div class="fcv-pro-all-title">Cached Lanes (${visibleRows.length} visible / ${cached.rows.length} cached)</div>
+            <table>
+                <thead>
+                    <tr>
+                        ${headers.map((header, index) => {
+                            const arrow = STATE.sortIndex === index ? (STATE.sortDirection === "asc" ? " ▲" : " ▼") : "";
+                            return `<th data-sort="${index}">${escapeHtml(header)}${arrow}</th>`;
+                        }).join("")}
+                    </tr>
+                </thead>
+                <tbody>
+                    ${visibleRows.map(row => {
+                        const tds = row.cells.map((value, index) => {
+                            let style = "";
+                            let title = "";
+
+                            if (map && index >= map.chute && index <= map.resources) {
+                                const bg = row.disabled ? STATUS_COLORS.disabled : row.family.color;
+                                style = `background:${bg};color:${colorText(bg)};font-weight:700;`;
+                                title = row.disabled ? "Disabled: blank stacking filter" : row.family.label;
+                            } else if (map && index >= map.slamReceived && index <= map.nextCpt) {
+                                style = `background:${row.status.color};color:#111;`;
+                                title = row.status.tooltip;
+                            }
+
+                            return `<td style="${style}" title="${escapeHtml(title)}">${escapeHtml(value)}</td>`;
+                        }).join("");
+                        return `<tr>${tds}</tr>`;
+                    }).join("")}
+                </tbody>
+            </table>
+        `;
+
+        Array.from(panel.querySelectorAll("th[data-sort]")).forEach(th => {
+            th.addEventListener("click", () => handleSort(Number(th.dataset.sort)));
+        });
+    }
+
+    function applyOriginalTableColoring() {
+        if (STATE.panels.allTable) return;
+
+        const table = getMainTable();
+        if (!table) return;
+
+        const map = getHeaderMap(table);
+        if (!map) return;
+
+        Array.from(table.querySelectorAll("tbody tr")).forEach(row => {
+            if (!row.children || row.children.length <= map.slamReceived) return;
+
+            const cells = Array.from(row.children);
+            const extracted = extractCurrentRows().rows.find(r => r.cells.join("|") === cells.map(c => norm(c.textContent)).join("|"));
+            if (!extracted) return;
+
+            cells.forEach(cell => {
+                cell.style.backgroundColor = "";
+                cell.style.color = "";
+                cell.title = "";
+                cell.classList.remove("fcv-pro-chute-zone");
+            });
+
+            for (let i = map.chute; i <= map.resources && i < cells.length; i++) {
+                const bg = extracted.disabled ? STATUS_COLORS.disabled : extracted.family.color;
+                cells[i].style.backgroundColor = bg;
+                cells[i].style.color = colorText(bg);
+                cells[i].title = extracted.disabled ? "Disabled: blank stacking filter" : extracted.family.label;
+                cells[i].classList.add("fcv-pro-chute-zone");
+            }
+
+            for (let i = map.slamReceived; i <= map.nextCpt && i < cells.length; i++) {
+                cells[i].style.backgroundColor = extracted.status.color;
+                cells[i].style.color = "#111";
+                cells[i].title = extracted.status.tooltip;
+            }
+
+            const visible = filterPass(extracted.family.key, extracted.disabled, extracted.recircValue);
+            row.classList.toggle("fcv-pro-row-hidden", !visible);
+            row.style.display = visible ? "" : "none";
+        });
+    }
+
+    async function scanAllPages() {
+        if (STATE.scanRunning) return;
+
+        STATE.scanRunning = true;
+        renderControlBar();
+
+        try {
+            addRowsToCache(extractCurrentRows().rows);
+
+            const buttons = Array.from(document.querySelectorAll("button, [role='button']"))
+                .map(button => ({ button, page: Number(norm(button.textContent)) }))
+                .filter(item => Number.isInteger(item.page) && item.page > 0)
+                .sort((a, b) => a.page - b.page);
+
+            const seen = new Set();
+
+            for (const item of buttons) {
+                if (seen.has(item.page)) continue;
+                seen.add(item.page);
+
+                item.button.click();
+                await sleep(CONFIG.scanDelayMs);
+                addRowsToCache(extractCurrentRows().rows);
+                renderControlBar();
+            }
+
+            STATE.panels.allTable = true;
+            savePrefs();
+        } finally {
+            STATE.scanRunning = false;
+            renderAll();
+        }
+    }
+
+    function removeOldRecircArea() {
+        Array.from(document.querySelectorAll("button, .collapsible"))
+            .filter(el => lower(el.textContent).includes("detailed recirc data"))
+            .forEach(button => {
+                if (button.nextElementSibling && button.nextElementSibling.id === "recirc") button.nextElementSibling.remove();
+                button.remove();
+            });
+
+        const recirc = document.getElementById("recirc");
+        if (recirc) recirc.remove();
+
+        Array.from(document.querySelectorAll(".predict")).forEach(table => {
+            const caption = lower(table.querySelector("caption")?.textContent || "");
+            if (caption.includes("lane watch") || caption.includes("by area")) table.remove();
+        });
+    }
+
+    function renderAll() {
+        if (!isForesightPage()) return;
+
+        ensureCreatorSignature();
+
+        STATE.hidden = false;
+        STATE.panels.allTable = false;
+        document.body.classList.toggle("fcv-pro-master-collapsed", STATE.collapsed);
+        document.body.classList.remove("fcv-pro-master-hidden");
+        document.body.classList.remove("fcv-pro-all-mode");
+        ensureShowTab();
+        removeOldRecircArea();
+
+        renderControlBar();
+        updateToolbarOffset();
+        /* legend merged into top row */
+
+        const current = extractCurrentRows();
+        addRowsToCache(current.rows);
+        const fullDom = refreshFullDomLaneCache();
+        const cached = getCachedRows();
+
+        renderGrafanaPanel();
+        renderAllocationsPanel();
+
+        renderTopRecircPanel(cached.rows.length ? cached.rows : (fullDom.rows.length ? fullDom.rows : current.rows));
+
+        const existingAllTable = document.getElementById(CONFIG.ids.allTable);
+        if (existingAllTable) existingAllTable.remove();
+
+        applyOriginalTableColoring();
+    }
+
+
+    function isAllocationPage() {
+        return location.href.includes("CrossBeltSorterAutoRecommendations");
+    }
+
+    function shouldRefreshAllocationsNow() {
+        const now = new Date();
+        return CONFIG.allocationScheduleMinutes.includes(now.getMinutes()) && now.getSeconds() <= 10;
+    }
+
+    let lastAllocationAutoRefreshKey = "";
+
+    function maybeAutoRefreshAllocations() {
+        const now = new Date();
+        const key = `${now.getHours()}:${now.getMinutes()}`;
+
+        if (shouldRefreshAllocationsNow() && key !== lastAllocationAutoRefreshKey) {
+            lastAllocationAutoRefreshKey = key;
+            refreshAllocationsHiddenFrame();
+            renderAll();
+        }
+    }
+
+
+    function ensureCreatorSignature() {
+        let signature = document.getElementById("fcv-pro-creator-signature");
+
+        if (!signature) {
+            signature = document.createElement("div");
+            signature.id = "fcv-pro-creator-signature";
+            signature.textContent = "created by @janazare";
+            document.body.appendChild(signature);
+        }
+    }
+
+    function startForesight() {
+        loadPrefs();
+        renderAll();
+        setTimeout(refreshAllocationsHiddenFrame, 2500);
+        setTimeout(() => {
+            refreshFullDomLaneCache();
+            renderAll();
+        }, 3500);
+        setTimeout(silentScanAllPagesForTopRecirc, 3500);
+
+        let timer = null;
+        const observer = new MutationObserver(() => {
+            clearTimeout(timer);
+            timer = setTimeout(renderAll, 150);
+        });
+
+        observer.observe(document.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["hidden", "aria-hidden", "style", "class"]
+        });
+
+        setInterval(cleanFloatingForesightStickyElements, 500);
+
+        setInterval(() => {
+            maybeAutoRefreshAllocations();
+            silentScanAllPagesForTopRecirc();
+            renderAll();
+        }, CONFIG.refreshMs);
+    }
+
+    function startGrafana() {
+        scrapeGrafanaLaneWatch();
+        setInterval(scrapeGrafanaLaneWatch, CONFIG.grafanaRefreshMs);
+    }
+
+
+    GM_addStyle(`
+
+/* FCV Pro v35 toolbar spacing fix */
+:root {
+    --fcv-pro-toolbar-height: 58px;
+}
+
+body.fcv-pro-has-fixed-bar {
+    padding-top: var(--fcv-pro-toolbar-height) !important;
+}
+
+#fcv-pro-control-bar {
+    min-height: 42px !important;
+    box-sizing: border-box !important;
+}
+
+#fcv-pro-grafana-panel,
+#fcv-pro-allocations-panel,
+#fcv-pro-top-recirc {
+    scroll-margin-top: calc(var(--fcv-pro-toolbar-height) + 8px) !important;
+}
+
+#fcv-pro-grafana-panel {
+    margin-top: 8px !important;
+}
+
+/* FCV Pro v34 stable UI */
+#fcv-pro-control-bar {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    width: 100vw !important;
+    z-index: 2147483000 !important;
+    margin: 0 !important;
+    border-radius: 0 !important;
+    background: #111827 !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,.28) !important;
+    display: flex !important;
+    justify-content: space-between !important;
+    align-items: center !important;
+    gap: 8px !important;
+}
+body.fcv-pro-has-fixed-bar { padding-top: var(--fcv-pro-toolbar-height) !important; }
+#fcv-pro-control-bar .fcv-pro-title,
+#fcv-pro-legend,
+button[data-panel="legend"],
+#fcv-pro-reset { display: none !important; }
+#fcv-pro-control-bar .fcv-pro-left-controls,
+#fcv-pro-control-bar .fcv-pro-right-controls {
+    display: inline-flex !important;
+    align-items: center !important;
+    flex-wrap: wrap !important;
+    gap: 6px !important;
+}
+#fcv-pro-control-bar .fcv-pro-left-controls { flex: 1 1 auto !important; }
+#fcv-pro-control-bar .fcv-pro-right-controls { justify-content: flex-end !important; }
+#fcv-pro-control-bar .fcv-pro-inline-legend {
+    display: inline-flex !important;
+    flex-wrap: wrap !important;
+    align-items: center !important;
+    gap: 6px 8px !important;
+}
+#fcv-pro-control-bar .fcv-pro-inline-legend span {
+    display: inline-flex !important;
+    align-items: center !important;
+    white-space: nowrap !important;
+    font-size: 11px !important;
+    font-weight: 900 !important;
+    color: #ffffff !important;
+}
+#fcv-pro-control-bar .fcv-pro-inline-legend b {
+    width: 11px !important;
+    height: 11px !important;
+    min-width: 11px !important;
+    display: inline-block !important;
+    border-radius: 2px !important;
+    border: 1px solid rgba(255,255,255,.75) !important;
+    margin-right: 3px !important;
+}
+#fcv-pro-dark-toggle { min-width: 34px; font-size: 14px !important; }
+#fcv-pro-grafana-panel .fcv-pro-panel-title {
+    background: #1F4E79 !important;
+    background-image: none !important;
+    color: #ffffff !important;
+    text-shadow: none !important;
+}
+#fcv-pro-allocations-panel .fcv-pro-panel-title {
+    background: #2E7D32 !important;
+    background-image: none !important;
+    color: #ffffff !important;
+    text-shadow: none !important;
+}
+#fcv-pro-top-recirc .fcv-pro-panel-title {
+    background: #374151 !important;
+    background-image: none !important;
+    color: #ffffff !important;
+    text-shadow: none !important;
+}
+#fcv-pro-grafana-panel .fcv-pro-panel-subtitle { display: none !important; }
+.awsui-table-container,
+.awsui-table-container *,
+[class*="awsui-table-container"],
+[class*="awsui-table-container"] *,
+table thead,
+table thead tr,
+table thead th {
+    position: static !important;
+    top: auto !important;
+    bottom: auto !important;
+    transform: none !important;
+}
+#fcv-pro-allocations-panel .fcv-pro-allocation-card {
+    padding: 2px 3px !important;
+    margin: 0 0 2px 0 !important;
+    line-height: 11px !important;
+}
+#fcv-pro-allocations-panel .fcv-pro-allocation-topline {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px;
+}
+#fcv-pro-allocations-panel .fcv-pro-allocation-chute {
+    min-width: auto !important;
+    padding: 1px 4px !important;
+    margin-right: 0 !important;
+    font-size: 10px !important;
+    line-height: 12px !important;
+}
+#fcv-pro-allocations-panel .fcv-pro-status-pill {
+    min-width: auto !important;
+    padding: 1px 5px !important;
+    font-size: 9px !important;
+    line-height: 12px !important;
+    white-space: nowrap;
+}
+#fcv-pro-allocations-panel .fcv-pro-subtext {
+    margin-top: 1px;
+    font-size: 9px !important;
+    line-height: 10px !important;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+#fcv-pro-allocations-panel .fcv-pro-allocation-filter,
+#fcv-pro-allocations-panel .fcv-pro-allocation-meta { display: none !important; }
+#fcv-pro-top-recirc .fcv-pro-top-line {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin: 0 0 2px 0;
+    padding: 2px 4px;
+    border-radius: 3px;
+    font-weight: 900;
+    border-bottom: 1px solid #e5e7eb;
+}
+#fcv-pro-top-recirc .fcv-pro-top-lane {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#fcv-pro-top-recirc .fcv-pro-top-count {
+    min-width: 24px;
+    text-align: right;
+}
+#fcv-pro-top-recirc .fcv-pro-top-good { background: #E8F5E9; color: #2E7D32; }
+#fcv-pro-top-recirc .fcv-pro-top-warning { background: #FFF4D6; color: #B45309; }
+#fcv-pro-top-recirc .fcv-pro-top-severe { background: #FDE2E1; color: #D13212; }
+body.fcv-pro-dark-mode,
+body.fcv-pro-dark-mode main,
+body.fcv-pro-dark-mode [class*="awsui"],
+body.fcv-pro-dark-mode .awsui-table-container {
+    background-color: #0f172a !important;
+    color: #e5e7eb !important;
+}
+body.fcv-pro-dark-mode input,
+body.fcv-pro-dark-mode select,
+body.fcv-pro-dark-mode textarea {
+    background-color: #111827 !important;
+    color: #f9fafb !important;
+    border-color: #374151 !important;
+}
+body.fcv-pro-dark-mode table,
+body.fcv-pro-dark-mode tbody,
+body.fcv-pro-dark-mode tr,
+body.fcv-pro-dark-mode td,
+body.fcv-pro-dark-mode th {
+    border-color: #374151 !important;
+}
+body.fcv-pro-dark-mode table th {
+    background-color: #1f2937 !important;
+    color: #f9fafb !important;
+}
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel,
+body.fcv-pro-dark-mode #fcv-pro-allocations-panel,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc {
+    background: #111827 !important;
+    color: #e5e7eb !important;
+    border-color: #374151 !important;
+}
+body.fcv-pro-dark-mode .fcv-pro-panel-subtitle,
+body.fcv-pro-dark-mode .fcv-pro-card-title,
+body.fcv-pro-dark-mode .fcv-pro-actions {
+    background: #1f2937 !important;
+    color: #e5e7eb !important;
+    border-color: #374151 !important;
+}
+body.fcv-pro-dark-mode .fcv-pro-empty,
+body.fcv-pro-dark-mode .fcv-pro-subtext { color: #cbd5e1 !important; }
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-good-row,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc .fcv-pro-top-good {
+    background: #12351f !important;
+    color: #86efac !important;
+}
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-warning-row,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc .fcv-pro-top-warning {
+    background: #422f0b !important;
+    color: #fbbf24 !important;
+}
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel .fcv-pro-severe-row,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc .fcv-pro-top-severe {
+    background: #451a1a !important;
+    color: #fca5a5 !important;
+}
+`);
+
+
+    GM_addStyle(`
+/* FCV Pro v36 final safety override */
+body.fcv-pro-dark-mode,
+body.fcv-pro-dark-mode main,
+body.fcv-pro-dark-mode [class*="awsui"],
+body.fcv-pro-dark-mode .awsui-table-container {
+    background-color: revert !important;
+    color: revert !important;
+}
+body.fcv-pro-dark-mode input,
+body.fcv-pro-dark-mode select,
+body.fcv-pro-dark-mode textarea {
+    background-color: revert !important;
+    color: revert !important;
+    border-color: revert !important;
+}
+/* Reapply dark mode to FCV panels only after the revert above */
+body.fcv-pro-dark-mode #fcv-pro-grafana-panel,
+body.fcv-pro-dark-mode #fcv-pro-allocations-panel,
+body.fcv-pro-dark-mode #fcv-pro-top-recirc {
+    background: #111827 !important;
+    color: #e5e7eb !important;
+    border-color: #374151 !important;
+}
+`);
+
+
+    GM_addStyle(`
+/* FCV Pro v37 final safety */
+body.fcv-pro-dark-mode {
+    background-color: inherit !important;
+    color: inherit !important;
+}
+
+/* Aggressively stop non-FCV Foresight table containers from floating fixed/sticky in viewport */
+body:not(.fcv-pro-allow-floating) *:not(#fcv-pro-control-bar):not(#fcv-pro-control-bar *):not(#fcv-pro-creator-signature) {
+    scroll-margin-top: var(--fcv-pro-toolbar-height, 58px) !important;
+}
+
+#fcv-pro-control-bar {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    width: 100vw !important;
+    z-index: 2147483000 !important;
+}
+
+body.fcv-pro-has-fixed-bar {
+    padding-top: var(--fcv-pro-toolbar-height, 58px) !important;
+}
+`);
+
+
+    GM_addStyle(`
+/* FCV Pro v39 single-scroll safety */
+html, body {
+    overflow-y: auto !important;
+}
+body.fcv-pro-has-fixed-bar {
+    padding-top: var(--fcv-pro-toolbar-height, 58px) !important;
+}
+#fcv-pro-control-bar {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    width: 100vw !important;
+    z-index: 2147483000 !important;
+}
+/* Do not force table headers static anymore. Duplicate clone rows are handled by JS. */
+table thead,
+table thead tr,
+table thead th {
+    transform: none !important;
+}
+`);
+
+    function start() {
+        console.debug("[FCV Pro] initialized", BUILD);
+        if (isGrafanaPage()) startGrafana();
+        else if (isForesightPage()) startForesight();
+    }
+
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+    else start();
+})();
